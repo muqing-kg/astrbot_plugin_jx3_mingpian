@@ -99,9 +99,12 @@ class ImageAPIClient:
                 if response.status != 200:
                     raise ImageAPIError(self._explain_http(response.status, raw))
                 try:
-                    return json.loads(raw)
+                    payload = json.loads(raw)
                 except json.JSONDecodeError:
                     raise ImageAPIError("生图接口返回的不是 JSON")
+                if not isinstance(payload, dict):
+                    raise ImageAPIError("生图接口返回结构异常")
+                return payload
         except ImageAPIError:
             raise
         except asyncio.TimeoutError:
@@ -165,6 +168,8 @@ class ImageAPIClient:
             if value.startswith("data:") and "," in value
             else value
         )
+        # 去掉空白再解码：服务端可能按列折行，validate=True 会因此拒绝合法数据
+        text = "".join(text.split())
         try:
             return base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError):
@@ -182,7 +187,7 @@ class ImageAPIClient:
             # 图片地址由生图服务返回，与 JX3API 的代理配置无关
             async with (
                 aiohttp.ClientSession(timeout=timeout) as session,
-                session.get(url) as response,
+                session.get(url, ssl=self.ssl_verify) as response,
             ):
                 if response.status != 200:
                     logger.warning("图片下载失败 %s: %s", response.status, url)
@@ -218,7 +223,7 @@ class ImageAPIClient:
         if not paths:
             raise ImageAPIError("edit 至少需要一张参考图")
 
-        order = self.keys.order()
+        order = self.keys.take_order()
         last_error = ""
         for key_index, key in enumerate(order):
             # 每条密钥先按 retries 重试，仍失败则换下一条
@@ -253,7 +258,6 @@ class ImageAPIClient:
                 )
                 try:
                     payload = await self._post(self.endpoint("edits"), key, form=form)
-                    self.keys.mark_used(key)
                     return await self._extract_image(payload)
                 except ImageAPIError as exc:
                     last_error = str(exc)

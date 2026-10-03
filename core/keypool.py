@@ -1,8 +1,8 @@
 """密钥池：多条密钥按轮询顺序使用。
 
 实例持有游标，多次请求之间共享，因此轮询是跨请求生效的。
-调用方每次取 ``order()`` 得到从当前游标开始的完整顺序，
-成功后用 ``mark_used()`` 把游标推进到下一条。
+调用方用 ``take_order()`` 取得从当前游标开始的完整顺序；该调用会立即推进游标，
+所以并发的多次请求各从不同密钥起步。
 """
 
 from __future__ import annotations
@@ -46,16 +46,21 @@ class KeyPool:
         return list(self._keys)
 
     def order(self) -> list[str]:
-        """从当前游标开始的轮询顺序。"""
+        """从当前游标开始的轮询顺序，不改变游标。"""
         if not self._keys:
             return []
         offset = self._cursor % len(self._keys)
         return self._keys[offset:] + self._keys[:offset]
 
-    def mark_used(self, key: str) -> None:
-        """记录某条密钥刚被成功使用，游标移到它的下一条。"""
-        if key in self._keys:
-            self._cursor = (self._keys.index(key) + 1) % len(self._keys)
+    def take_order(self) -> list[str]:
+        """取一份轮询顺序，并立即把游标推进一步。
+
+        取键与推进之间没有 await，并发的多次请求因此各从不同密钥起步。
+        """
+        order = self.order()
+        if self._keys:
+            self._cursor = (self._cursor + 1) % len(self._keys)
+        return order
 
     @staticmethod
     def is_credential_failure(message: str) -> bool:

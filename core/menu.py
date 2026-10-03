@@ -81,3 +81,7 @@ async def ask_choice(
             logger.exception("默认选项执行失败")
     except Exception:
         logger.exception("选择等待异常")
+        try:
+            await fail(event, "选择等待异常，请重新发送命令")
+        except Exception:
+            logger.exception("异常提示发送失败")

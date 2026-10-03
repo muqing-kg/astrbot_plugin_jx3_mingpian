@@ -4,22 +4,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .sizes import UNSPECIFIED
+
 DEFAULT_TASK_HINT = "正在努力生成图片中，请耐心等待几分钟..."
 DEFAULT_PROMPT_NAME = "提示词"
 MENU_TITLE = "名片特写"
 CHOICE_TIMEOUT = 15
 
-# 名片特写出图尺寸。提示词均为横幅构图，21:9
-POSTER_SIZE = "2048x880"
-
 
 @dataclass(frozen=True)
 class Prompt:
-    """一条提示词。index 从 1 起，与清单展示的序号一致。"""
+    """一条提示词。index 从 1 起，与清单展示的序号一致。
+
+    ratio 为该提示词适用的宽高比，取「不指定」时出图尺寸交给接口自己决定。
+    """
 
     index: int
     name: str
     text: str
+    ratio: str = UNSPECIFIED
 
 
 def load_prompts(raw: object) -> list[Prompt]:
@@ -39,7 +42,10 @@ def load_prompts(raw: object) -> list[Prompt]:
             str(item.get("name") or "").strip()
             or f"{DEFAULT_PROMPT_NAME}{len(prompts) + 1}"
         )
-        prompts.append(Prompt(index=len(prompts) + 1, name=name, text=text))
+        ratio = str(item.get("ratio") or "").strip() or UNSPECIFIED
+        prompts.append(
+            Prompt(index=len(prompts) + 1, name=name, text=text, ratio=ratio)
+        )
     return prompts
 
 
@@ -58,14 +64,3 @@ def task_hint(value: object) -> str:
     """生图等待提示。配置为空时使用默认文案。"""
     text = str(value or "").strip()
     return text or DEFAULT_TASK_HINT
-
-
-def render_prompt(template: str, *, school: str, scene: str, accent: str) -> str:
-    """替换提示词中的 {school} / {scene} / {accent} 占位符。
-
-    自定义提示词不含占位符时按原文使用；含无法识别的花括号时同样按原文使用。
-    """
-    try:
-        return template.format(school=school, scene=scene, accent=accent)
-    except (KeyError, IndexError, ValueError):
-        return template

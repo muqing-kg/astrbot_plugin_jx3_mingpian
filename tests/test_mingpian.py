@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib.util
 import inspect
@@ -22,7 +23,7 @@ from core.access import (
     is_allowed,
     load_whitelist,
 )
-from core.binding import BindingStore, parse_card_args
+from core.binding import UNBOUND_HINT, BindingStore, parse_card_args
 from core.card import AVATAR_SIZE, CARD_SIZE, build_payload
 from core.image_api import (
     DEFAULT_MODEL,
@@ -44,14 +45,21 @@ from core.mingpian_data import (
 )
 from core.prompts import (
     DEFAULT_TASK_HINT,
-    POSTER_SIZE,
     Prompt,
     load_prompts,
     menu_text,
-    render_prompt,
     task_hint,
 )
 from core.servers import OFFICIAL_SERVERS, canonical_server, server_list_text
+from core.sizes import (
+    AUTO,
+    DEFAULT_CARD_RATIO,
+    RATIO_OPTIONS,
+    RATIO_SIZES,
+    UNSPECIFIED,
+    card_size,
+    prompt_size,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates" / "standalone" / "mingpian.html"
@@ -133,6 +141,14 @@ class TestImageClient:
         payload = {"data": [{"b64_json": f"data:image/png;base64,{encoded}"}]}
         assert await self._client()._extract_image(payload) == blob
 
+    async def test_容忍折行的_base64(self):
+        """服务端按列折行时不得丢弃图片。"""
+        blob = b"\x89PNG-fake" * 20
+        encoded = base64.b64encode(blob).decode()
+        folded = "\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+        payload = {"data": [{"b64_json": folded}]}
+        assert await self._client()._extract_image(payload) == blob
+
     async def test_下载_url_图片(self, monkeypatch):
         blob = b"\x89PNG-from-url"
         client = self._client()
@@ -194,6 +210,18 @@ class TestApiContract:
         body = source.split("async def get_bytes", 1)[1]
         assert "self._get(" not in body
         assert '"token"' not in body
+
+    def test_限流文案能被密钥池识别(self):
+        """密钥池按文案判断是否换密钥，429 的文案必须含「限流」。"""
+        source = (ROOT / "core" / "jx3api.py").read_text(encoding="utf-8")
+        assert 'raise JX3APIError(f"JX3API 限流：{message}")' in source
+        assert KeyPool.is_credential_failure("JX3API 限流：code=429")
+
+    def test_图片下载捕超时(self):
+        """get_bytes 只捕 ClientError 时，超时会以空文案冒到用户面前。"""
+        source = (ROOT / "core" / "jx3api.py").read_text(encoding="utf-8")
+        body = source.split("async def get_bytes", 1)[1]
+        assert "except asyncio.TimeoutError:" in body
 
     def test_README_与代码一致(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -289,7 +317,6 @@ class TestPayload:
         payload = self._payload()
         assert payload["bgImage"].startswith("data:image/png;base64,")
         assert payload["avatar"].startswith("data:image/png;base64,")
-        assert payload["overlayMode"] is True
 
     def test_门派字段齐全(self):
         payload = self._payload()
@@ -316,6 +343,17 @@ class TestPayload:
                 needed.add(match.group(1))
         missing = sorted(needed - set(self._payload()) - internal)
         assert not missing, f"模板要这些变量，payload 没给：{missing}"
+
+    def test_payload_没有多余字段(self):
+        """反向：payload 里不该留下模板已经不用的字段。"""
+        template = TEMPLATE.read_text(encoding="utf-8")
+        used: set[str] = set()
+        for block in re.findall(r"\{\{(.*?)\}\}", template, re.DOTALL):
+            used |= set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", block))
+        for block in re.findall(r"\{%(.*?)%\}", template, re.DOTALL):
+            used |= set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", block))
+        unused = sorted(set(self._payload()) - used)
+        assert not unused, f"payload 多给了模板不用的字段：{unused}"
 
     def test_字体与标识都嵌进去了(self):
         payload = self._payload()
@@ -425,6 +463,16 @@ class TestPrompts:
         prompts = load_prompts([{"name": "", "prompt": "内容"}])
         assert prompts[0].name == "提示词1"
 
+    def test_读取每条的比例(self):
+        prompts = load_prompts(
+            [
+                {"name": "甲", "prompt": "内容甲", "ratio": "21:9"},
+                {"name": "乙", "prompt": "内容乙"},
+                {"name": "丙", "prompt": "内容丙", "ratio": "   "},
+            ]
+        )
+        assert [p.ratio for p in prompts] == ["21:9", UNSPECIFIED, UNSPECIFIED]
+
     @pytest.mark.parametrize("raw", [None, "", {}, 123, [1, 2], ["字符串"]])
     def test_配置异常返回空清单(self, raw):
         assert load_prompts(raw) == []
@@ -451,26 +499,43 @@ class TestPrompts:
     def test_等待提示回退默认(self, raw, expected):
         assert task_hint(raw) == expected
 
-    def test_替换占位符(self):
-        out = render_prompt(
-            "门派{school} 场景{scene} 色{accent}",
-            school="唐门",
-            scene="蜀中",
-            accent="#123456",
-        )
-        assert out == "门派唐门 场景蜀中 色#123456"
 
-    def test_无占位符按原文(self):
-        text = "采用21:9超宽横向角色海报：超大双眼极近特写铺满背景"
-        assert (
-            render_prompt(text, school="唐门", scene="蜀中", accent="#123456") == text
-        )
+class TestResolveCard:
+    """名片特写只用形象图，不取角色详情。"""
 
-    def test_含未知花括号按原文(self):
-        text = "带 {未知} 的提示词"
-        assert (
-            render_prompt(text, school="唐门", scene="蜀中", accent="#123456") == text
+    async def _run(self, **kwargs):
+        from core.card import resolve_card
+
+        calls: list[str] = []
+
+        class FakeJX3:
+            async def card_records(self, server, name):
+                calls.append("card_records")
+                return [{"showAvatar": "http://x/a.png"}]
+
+            async def get_bytes(self, url):
+                calls.append("get_bytes")
+                return b"\x89PNG-art"
+
+            async def role_detail(self, server, name):
+                calls.append("role_detail")
+                return {"forceName": "唐门", "roleName": "小螺卜头"}
+
+        source = await resolve_card(
+            FakeJX3(), server="飞龙在天", name="小螺卜头", **kwargs
         )
+        return calls, source
+
+    async def test_默认取角色详情(self):
+        calls, source = await self._run()
+        assert calls == ["card_records", "get_bytes", "role_detail"]
+        assert source.school == "唐门"
+
+    async def test_可跳过角色详情(self):
+        calls, source = await self._run(with_detail=False)
+        assert calls == ["card_records", "get_bytes"]
+        assert source.school == ""
+        assert source.nickname == "小螺卜头"
 
 
 class TestReferenceImages:
@@ -652,18 +717,33 @@ class TestConfigSchema:
         item = self._schema()["mingpian_prompts"]
         assert item["type"] == "template_list"
         assert item["templates"]["prompt_item"]["display_item"] == "name"
-        assert set(item["templates"]["prompt_item"]["items"]) == {"name", "prompt"}
+        assert set(item["templates"]["prompt_item"]["items"]) == {
+            "name",
+            "ratio",
+            "prompt",
+        }
 
     def test_默认提示词可被解析(self):
         defaults = self._schema()["mingpian_prompts"]["default"]
         prompts = load_prompts(defaults)
-        assert len(prompts) == 3
+        assert len(prompts) == 5
         assert [p.name for p in prompts] == [
             "双眼特写",
             "双眼特写（电影黑条）",
             "多视角海报",
+            "手办化",
+            "破屏而出",
         ]
-        assert all(len(p.text) > 500 for p in prompts)
+        assert [p.ratio for p in prompts] == [
+            "21:9",
+            "21:9",
+            "21:9",
+            UNSPECIFIED,
+            UNSPECIFIED,
+        ]
+        # 前四条是长文提示词；破屏而出是有意留短的指令
+        assert all(len(p.text) > 500 for p in prompts[:4])
+        assert prompts[4].text == "破屏而出"
 
 
 class TestCloseupCommand:
@@ -715,8 +795,9 @@ class TestCloseupCommand:
             seen["timeout"] = timeout
             await run(2, event)
 
-        async def fake_resolve(jx3, *, server, name, index=None):
+        async def fake_resolve(jx3, *, server, name, index=None, with_detail=True):
             seen["index"] = index
+            seen["with_detail"] = with_detail
             return types.SimpleNamespace(
                 school="唐门",
                 scene="蜀中",
@@ -738,6 +819,7 @@ class TestCloseupCommand:
         assert seen["count"] == 2 and seen["timeout"] == plugin_main.CHOICE_TIMEOUT
         assert "1. 甲" in seen["menu"] and "2. 乙" in seen["menu"]
         assert seen["index"] == 1
+        assert seen["with_detail"] is False, "名片特写不该取角色详情"
         assert seen["prompt"].name == "乙"
         assert event.texts == [DEFAULT_TASK_HINT]
         assert event.images and event.images[0].startswith("base64://")
@@ -768,7 +850,7 @@ class TestCloseupCommand:
         async def fake_ask(event, text, count, run, *, timeout=0):
             await run(1, event)
 
-        async def fake_resolve(jx3, *, server, name, index=None):
+        async def fake_resolve(jx3, *, server, name, index=None, with_detail=True):
             return types.SimpleNamespace(
                 school="", scene="", accent="#000000", note="n"
             )
@@ -790,7 +872,7 @@ class TestCloseupCommand:
         async def fake_ask(event, text, count, run, *, timeout=0):
             await run(1, event)
 
-        async def fake_resolve(jx3, *, server, name, index=None):
+        async def fake_resolve(jx3, *, server, name, index=None, with_detail=True):
             return types.SimpleNamespace(
                 school="唐门",
                 scene="蜀中",
@@ -826,32 +908,33 @@ class TestKeyPool:
 
     def test_从副本构造保留游标(self):
         pool = KeyPool(["k1", "k2", "k3"])
-        pool.mark_used("k2")
+        pool.take_order()
         copy = KeyPool(pool)
-        assert copy.order() == ["k3", "k1", "k2"]
+        assert copy.order() == ["k2", "k3", "k1"]
 
-    def test_轮询顺序随游标推进(self):
+    def test_取顺序时推进游标(self):
         pool = KeyPool(["k1", "k2", "k3"])
         assert pool.order() == ["k1", "k2", "k3"]
-        pool.mark_used("k1")
+        assert pool.take_order() == ["k1", "k2", "k3"]
         assert pool.order() == ["k2", "k3", "k1"]
-        pool.mark_used("k3")
-        assert pool.order() == ["k1", "k2", "k3"]
+        assert pool.take_order() == ["k2", "k3", "k1"]
+        assert pool.order() == ["k3", "k1", "k2"]
 
-    def test_标记未知密钥不改变游标(self):
-        pool = KeyPool(["k1", "k2"])
-        pool.mark_used("unknown")
-        assert pool.order() == ["k1", "k2"]
+    def test_并发取键各得不同起点(self):
+        """并发请求必须从不同密钥起步，否则密钥池在最需要分流时不生效。"""
+        pool = KeyPool(["k1", "k2", "k3"])
+        assert [pool.take_order()[0] for _ in range(4)] == ["k1", "k2", "k3", "k1"]
 
     def test_sync_保留游标位置(self):
         pool = KeyPool(["k1", "k2", "k3"])
-        pool.mark_used("k2")
+        pool.take_order()
         pool.sync(["k1", "k2", "k3"])
-        assert pool.order() == ["k3", "k1", "k2"]
+        assert pool.order() == ["k2", "k3", "k1"]
 
     def test_sync_缩短后游标取模(self):
         pool = KeyPool(["k1", "k2", "k3"])
-        pool.mark_used("k3")
+        pool.take_order()
+        pool.take_order()
         pool.sync(["k1", "k2"])
         assert pool.order() in (["k1", "k2"], ["k2", "k1"])
 
@@ -956,6 +1039,22 @@ class TestMultiKeyRotation:
         monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
         await client.edit("提示词", [REF_IMAGE], size=CARD_SIZE)
         assert client.keys.order() == ["k2", "k1"]
+
+    async def test_并发生图从不同密钥起步(self, monkeypatch):
+        """底卡与头像并发发出，两次请求必须各用一条密钥。"""
+        client = ImageAPIClient("https://hub.example.com", ["k1", "k2"])
+        seen: list[str] = []
+
+        async def fake_post(self, url, key, *, form):
+            seen.append(key)
+            return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        await asyncio.gather(
+            client.edit("提示词", [REF_IMAGE], size=CARD_SIZE),
+            client.edit("提示词", [REF_IMAGE], size=CARD_SIZE),
+        )
+        assert seen == ["k1", "k2"]
 
     async def test_生图非凭据错误不换密钥(self, monkeypatch):
         client = ImageAPIClient("https://hub.example.com", ["k1", "k2"])
@@ -1090,7 +1189,7 @@ class TestWhitelistCommand:
         async def fake_ask(event, text, count, run, *, timeout=0):
             await run(1, event)
 
-        async def fake_resolve(jx3, *, server, name, index=None):
+        async def fake_resolve(jx3, *, server, name, index=None, with_detail=True):
             return types.SimpleNamespace(
                 school="", scene="", accent="#000000", note="n"
             )
@@ -1105,6 +1204,68 @@ class TestWhitelistCommand:
         event = _FakeEvent(sender="u1", msg="名片特写 飞龙在天 小螺卜头")
         await plugin.mingpian_closeup(event)
         assert event.texts[0] == DEFAULT_TASK_HINT
+
+
+class TestBuildCard:
+    """名片卡链路：底图尺寸来自调用方、头像固定 1:1、仍取角色详情。"""
+
+    async def _run(self, monkeypatch, **kwargs):
+        from core import card as card_mod
+
+        seen: dict = {}
+
+        async def fake_resolve(jx3, *, server, name, index=None, with_detail=True):
+            seen["with_detail"] = with_detail
+            return card_mod.CardSource(
+                server=server,
+                nickname=name,
+                school="唐门",
+                body="萝莉",
+                camp="恶人谷",
+                tong="英雄长乐坊",
+                art=b"\x89PNG-art",
+                card_no=1,
+                card_total=4,
+                accent="#123456",
+                scene="蜀中",
+            )
+
+        async def fake_generate_base(image, source, prompt, **opts):
+            seen["base_size"] = opts.get("size")
+            return b"base"
+
+        async def fake_generate_avatar(image, source):
+            seen["avatar_called"] = True
+            return b"avatar"
+
+        monkeypatch.setattr(card_mod, "resolve_card", fake_resolve)
+        monkeypatch.setattr(card_mod, "generate_base", fake_generate_base)
+        monkeypatch.setattr(card_mod, "generate_avatar", fake_generate_avatar)
+
+        class FakeImage:
+            configured = True
+
+        payload, note = await card_mod.build_card(
+            None, FakeImage(), server="飞龙在天", name="小螺卜头", **kwargs
+        )
+        return seen, payload, note
+
+    async def test_底图尺寸来自调用方(self, monkeypatch):
+        seen, payload, note = await self._run(monkeypatch, size="2048x880")
+        assert seen["base_size"] == "2048x880"
+        assert seen["avatar_called"] is True
+        assert payload["bgImage"].startswith("data:image/png;base64,")
+        assert note == "飞龙在天 · 小螺卜头 · 第 1/4 张"
+
+    async def test_尺寸缺省时用默认(self, monkeypatch):
+        from core import card as card_mod
+
+        seen, _, _ = await self._run(monkeypatch)
+        assert seen["base_size"] == card_mod.CARD_SIZE == "2048x1152"
+
+    async def test_仍会取角色详情(self, monkeypatch):
+        seen, _, _ = await self._run(monkeypatch, size="2048x1152")
+        assert seen["with_detail"] is True, "名片卡要门派等信息，必须取角色详情"
 
 
 class TestCardCommand:
@@ -1225,6 +1386,10 @@ class TestBindingStore:
         path = tmp_path / "b.json"
         path.write_text("{不是 json", encoding="utf-8")
         assert BindingStore(path).get("umo1") == ""
+
+    def test_未绑定提示用的是真实命令名(self):
+        """提示里的命令必须真的存在，否则用户照做不会有任何回音。"""
+        assert f"「{plugin_main.BIND_COMMAND} 区服名」" in UNBOUND_HINT
 
 
 class TestCommandPattern:
@@ -1427,15 +1592,114 @@ class TestCleanup:
         plugin_main.JX3MingpianPlugin._cleanup(str(tmp_path / "nope.png"))
 
 
+class TestHelpCommand:
+    def _plugin(self, **conf):
+        base = {
+            "jx3api_base_url": "https://www.jx3api.com",
+            "jx3api_token": "t",
+            "image_api_base_url": "https://hub.example.com",
+            "image_api_key": "k",
+            "image_api_model": "gpt-image-2.5",
+        }
+        base.update(conf)
+        return plugin_main.JX3MingpianPlugin(context=None, config=base)
+
+    async def test_返回一张说明图(self, monkeypatch):
+        monkeypatch.setattr(
+            plugin_main.JX3MingpianPlugin,
+            "_render",
+            lambda self, payload, template=None: _async_value("http://img/help.png"),
+        )
+        event = _FakeEvent(msg="名片帮助")
+        await self._plugin().help_image(event)
+        assert event.images == ["http://img/help.png"]
+
+    async def test_名单外被拒(self):
+        event = _FakeEvent(msg="名片帮助")
+        await self._plugin(whitelist_enabled=True, whitelist=["u9"]).help_image(event)
+        assert event.texts == [DENIED_MESSAGE]
+
+    async def test_渲染失败返回原因(self, monkeypatch):
+        async def boom(self, payload, template=None):
+            raise RuntimeError("渲染器不可用")
+
+        monkeypatch.setattr(plugin_main.JX3MingpianPlugin, "_render", boom)
+        event = _FakeEvent(msg="名片帮助")
+        await self._plugin().help_image(event)
+        assert event.texts and "渲染帮助图失败" in event.texts[0]
+
+    def test_payload_命令名取自命令常量(self):
+        payload = plugin_main.help_payload()
+        rows = payload["generators"] + payload["admins"]
+        assert [row["cmd"] for row in rows] == [
+            plugin_main.COMMAND,
+            plugin_main.CLOSEUP_COMMAND,
+            plugin_main.BIND_COMMAND,
+            plugin_main.VIEW_BIND_COMMAND,
+            plugin_main.HELP_COMMAND,
+        ]
+
+    def test_帮助图模板可渲染(self):
+        """模板不得残留未解析标记，且每条命令都要出现在图里。"""
+        jinja2 = pytest.importorskip("jinja2")
+        html = (
+            jinja2.Environment(autoescape=False, trim_blocks=True, lstrip_blocks=True)
+            .from_string(plugin_main.load_help_template())
+            .render(**plugin_main.help_payload())
+        )
+        assert "{{" not in html and "{%" not in html
+        for row in plugin_main.help_payload()["generators"]:
+            assert row["cmd"] in html
+
+
 class TestSizes:
-    """尺寸写死在各自功能的模块里，调整时只改一处。"""
+    """比例映射只在 core/sizes.py 一处；只发 OpenAI 原生的 size 字段。"""
 
     def test_名片卡尺寸(self):
         assert CARD_SIZE == "2048x1152"
         assert AVATAR_SIZE == "1024x1024"
 
-    def test_名片特写尺寸(self):
-        assert POSTER_SIZE == "2048x880"
+    def test_名片卡比例缺失时退回默认(self):
+        assert card_size("") == "2048x1152"
+        assert card_size(None) == "2048x1152"
+        assert card_size("不指定") == "2048x1152"
+        assert card_size("瞎写") == "2048x1152"
+
+    def test_名片卡比例可配(self):
+        assert card_size("21:9") == "2048x880"
+        assert card_size("1:1") == "1024x1024"
+
+    def test_特写不指定时交给接口(self):
+        assert prompt_size(UNSPECIFIED) == AUTO
+        assert prompt_size("") == AUTO
+        assert prompt_size(None) == AUTO
+        assert prompt_size("瞎写") == AUTO
+
+    def test_特写比例(self):
+        assert prompt_size("21:9") == "2048x880"
+        assert prompt_size("16:9") == "2048x1152"
+
+    def test_比例映射都过_OpenAI_约束(self):
+        """宽高被 16 整除、最长边不超 3840、总像素 655360~8294400。
+
+        比例容差 0.01：21:9 用的是 2048x880（2.327），不是精确的 7:3。
+        """
+        for ratio, size in RATIO_SIZES.items():
+            width, height = (int(v) for v in size.split("x"))
+            left, right = (int(v) for v in ratio.split(":"))
+            assert width % 16 == 0 and height % 16 == 0, size
+            assert max(width, height) <= 3840, size
+            assert 655360 <= width * height <= 8294400, size
+            assert abs(width / height - left / right) < 0.01, (ratio, size)
+
+    def test_配置下拉与映射表同步(self):
+        """schema 的下拉选项与 core/sizes.py 的映射表必须一一对应。"""
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["mingpian_prompts"]["templates"]["prompt_item"]["items"]
+        assert items["ratio"]["options"] == list(RATIO_OPTIONS)
+        assert items["ratio"]["default"] == UNSPECIFIED
+        assert schema["mingpian_card_ratio"]["options"] == list(RATIO_SIZES)
+        assert schema["mingpian_card_ratio"]["default"] == DEFAULT_CARD_RATIO
 
     def test_生图接口不设默认尺寸(self):
         """size 为必填，避免调用方漏传时静默用错尺寸。"""

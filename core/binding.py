@@ -9,7 +9,9 @@ from pathlib import Path
 logger = logging.getLogger("astrbot")
 
 FILENAME = "bindings.json"
-UNBOUND_HINT = "未绑定区服。请先发送「绑定 区服名」，或按「名片卡 服务器 角色名」填写。"
+UNBOUND_HINT = (
+    "未绑定区服。请先发送「名片绑定 区服名」，或按「名片卡 服务器 角色名」填写。"
+)
 
 
 class BindingStore:
@@ -23,7 +25,10 @@ class BindingStore:
     def _load(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
         except (OSError, ValueError):
+            logger.warning("区服绑定读取失败，按空名单继续：%s", self.path)
             return
         if isinstance(raw, dict):
             self._data = {

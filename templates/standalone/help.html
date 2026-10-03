@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <title>命令说明</title>
+    <meta charset="utf-8">
+    <style>
+        {% if cardFont %}
+        @font-face {
+            font-family: "名片字体";
+            src: url("{{ cardFont }}") format("woff2");
+            font-display: block;
+        }
+        {% endif %}
+
+        {% if brushFont %}
+        @font-face {
+            font-family: "名片行楷";
+            src: url("{{ brushFont }}") format("truetype");
+            font-display: block;
+        }
+        {% endif %}
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            width: max-content;
+            background: #fff;
+            font-family: "名片字体", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .sheet {
+            width: 880px;
+            padding: 46px 54px 40px;
+            background: linear-gradient(160deg, #2c1d36 0%, #3d2645 52%, #1c1220 100%);
+            color: #fff;
+        }
+
+        .head {
+            display: flex;
+            align-items: center;
+            gap: 22px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+        }
+
+        .head__logo {
+            flex: none;
+            width: 76px;
+            height: 76px;
+            object-fit: contain;
+            /* 深紫底会把 logo 自带的紫色压掉，提亮并加一点暖色辉光把它托起来 */
+            filter: brightness(1.18) saturate(1.08) drop-shadow(0 0 18px rgba(255, 170, 90, 0.35));
+        }
+
+        .head__title {
+            font-family: "名片行楷", "STXingkai", "KaiTi", serif;
+            font-size: 42px;
+            letter-spacing: 5px;
+        }
+
+        .head__sub {
+            margin-top: 8px;
+            font-size: 15px;
+            letter-spacing: 1px;
+            color: rgba(255, 255, 255, 0.58);
+        }
+
+        .section {
+            margin-top: 32px;
+        }
+
+        .section__title {
+            font-size: 17px;
+            letter-spacing: 4px;
+            color: #e9cdff;
+        }
+
+        .section__title::before {
+            content: "";
+            display: inline-block;
+            width: 4px;
+            height: 15px;
+            margin-right: 11px;
+            vertical-align: -1px;
+            border-radius: 2px;
+            background: #bb8ce4;
+        }
+
+        .row {
+            display: flex;
+            align-items: baseline;
+            gap: 18px;
+            margin-top: 18px;
+        }
+
+        /* 命令名固定栏宽，右侧说明才能对齐成一列 */
+        .row__cmd {
+            flex: none;
+            width: 268px;
+            font-size: 20px;
+            letter-spacing: 1px;
+        }
+
+        .row__args {
+            margin-left: 12px;
+            font-size: 15px;
+            color: rgba(255, 255, 255, 0.52);
+        }
+
+        .row__desc {
+            font-size: 16px;
+            line-height: 1.5;
+            color: rgba(255, 255, 255, 0.82);
+        }
+
+        .ex {
+            margin-top: 12px;
+            padding: 13px 18px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.07);
+            font-size: 18px;
+            letter-spacing: 1px;
+            color: #f4e8ff;
+        }
+
+        .notes {
+            margin-top: 16px;
+        }
+
+        .notes li {
+            list-style: none;
+            font-size: 15px;
+            line-height: 1.95;
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .notes li::before {
+            content: "·";
+            margin-right: 11px;
+            color: #bb8ce4;
+        }
+
+        .foot {
+            margin-top: 36px;
+            padding-top: 18px;
+            border-top: 1px solid rgba(255, 255, 255, 0.16);
+            font-size: 14px;
+            letter-spacing: 1px;
+            color: rgba(255, 255, 255, 0.45);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="sheet">
+        <div class="head">
+            {% if logo %}<img class="head__logo" src="{{ logo }}" alt="">{% endif %}
+            <div>
+                <div class="head__title">名片卡命令说明</div>
+                <div class="head__sub">剑网3 名片卡（生图）</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section__title">生成</div>
+            {% for row in generators %}
+            <div class="row">
+                <div class="row__cmd">{{ row.cmd | e }}<span class="row__args">{{ row.args | e }}</span></div>
+                <div class="row__desc">{{ row.desc | e }}</div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="section">
+            <div class="section__title">管理</div>
+            {% for row in admins %}
+            <div class="row">
+                <div class="row__cmd">{{ row.cmd | e }}<span class="row__args">{{ row.args | e }}</span></div>
+                <div class="row__desc">{{ row.desc | e }}</div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="section">
+            <div class="section__title">示例</div>
+            {% for text in examples %}
+            <div class="ex">{{ text | e }}</div>
+            {% endfor %}
+        </div>
+
+        <div class="section">
+            <div class="section__title">说明</div>
+            <ul class="notes">
+                {% for text in notes %}
+                <li>{{ text | e }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <div class="foot">本图由「{{ helpCommand | e }}」命令生成</div>
+    </div>
+</body>
+
+</html>

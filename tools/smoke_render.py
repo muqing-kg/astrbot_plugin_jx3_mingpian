@@ -71,11 +71,10 @@ def render(html: str, out: Path) -> Path:
                     f"{label} 没在诗句面板里居中：左 {gap_l:.0f}px 右 {gap_r:.0f}px"
                 )
 
-        for label, b in (("诗句面板", side), ("立绘", box(".portrait"))):
-            if b and card:
-                assert b["y"] >= -1 and b["y"] + b["height"] <= card["height"] + 1, (
-                    f"{label} 溢出卡片"
-                )
+        if side and card:
+            assert (
+                side["y"] >= -1 and side["y"] + side["height"] <= card["height"] + 1
+            ), "诗句面板溢出卡片"
 
         page.locator(".card").screenshot(path=str(out))
         browser.close()

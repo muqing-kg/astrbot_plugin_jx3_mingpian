@@ -21,6 +21,7 @@ import logging
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 from urllib.request import url2pathname
 
 import astrbot.api.message_components as Comp
@@ -36,7 +37,14 @@ from .core.access import (
 )
 from .core.binding import FILENAME as BINDING_FILE
 from .core.binding import BindingStore, parse_card_args
-from .core.card import build_card, build_closeup, resolve_card
+from .core.card import (
+    brush_font_uri,
+    build_card,
+    build_closeup,
+    card_font_uri,
+    logo_uri,
+    resolve_card,
+)
 from .core.image_api import ImageAPIClient, ImageAPIError, normalize_api_base
 from .core.jx3api import JX3APIClient, JX3APIError
 from .core.keypool import KeyPool
@@ -44,18 +52,23 @@ from .core.menu import CHOICE_TIMEOUT, ask_choice
 from .core.mingpian_data import parse_card_index
 from .core.prompts import Prompt, load_prompts, menu_text, task_hint
 from .core.servers import canonical_server, server_list_text
+from .core.sizes import card_size
 
 logger = logging.getLogger("astrbot")
 
 PLUGIN_NAME = "astrbot_plugin_jx3_mingpian"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 COMMAND = "名片卡"
 CLOSEUP_COMMAND = "名片特写"
 BIND_COMMAND = "名片绑定"
 VIEW_BIND_COMMAND = "查看名片区服"
+HELP_COMMAND = "名片帮助"
 DEFAULT_CONCURRENT = 3
 TEMPLATE_PATH = (
     Path(__file__).resolve().parent / "templates" / "standalone" / "mingpian.html"
+)
+HELP_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent / "templates" / "standalone" / "help.html"
 )
 
 RENDER_OPTIONS = {
@@ -71,6 +84,51 @@ RENDER_OPTIONS = {
 def load_template() -> str:
     """模板为自包含单文件，读取一次后缓存。"""
     return TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=1)
+def load_help_template() -> str:
+    """帮助图模板，同样读一次后缓存。"""
+    return HELP_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def help_payload() -> dict[str, Any]:
+    """帮助图 payload。命令名一律取自命令常量，避免与实现脱节。"""
+    return {
+        "cardFont": card_font_uri(),
+        "brushFont": brush_font_uri(),
+        "logo": logo_uri(),
+        "helpCommand": HELP_COMMAND,
+        "generators": [
+            {
+                "cmd": COMMAND,
+                "args": "服务器 角色名 [序号]",
+                "desc": "取名片形象图，生成完整名片卡",
+            },
+            {
+                "cmd": CLOSEUP_COMMAND,
+                "args": "服务器 角色名 [序号]",
+                "desc": "先选提示词，再生成对应的海报",
+            },
+        ],
+        "admins": [
+            {"cmd": BIND_COMMAND, "args": "区服名", "desc": "为当前会话绑定默认区服"},
+            {"cmd": VIEW_BIND_COMMAND, "args": "", "desc": "查看当前会话绑定的区服"},
+            {"cmd": HELP_COMMAND, "args": "", "desc": "返回这张命令说明图"},
+        ],
+        "examples": [
+            f"{COMMAND} 飞龙在天 小螺卜头 1",
+            f"{CLOSEUP_COMMAND} 飞龙在天 小螺卜头",
+            f"{BIND_COMMAND} 飞龙在天",
+        ],
+        "notes": [
+            "序号指名片序号：一个角色可以有多张名片，填 1 就取第 1 张；省略序号时随机抽一张",
+            "已绑定区服的会话可以省略服务器参数",
+            "名片卡每次消耗 2 次 JX3API 令牌；名片特写 1 次",
+            "管理命令仅 AstrBot 管理员可用；白名单开启时另受白名单限制",
+            "同时生成上限、名片卡比例与提示词清单均在插件配置里维护",
+        ],
+    }
 
 
 def usage() -> str:
@@ -181,12 +239,15 @@ class JX3MingpianPlugin(Star):
 
     # ---------- 渲染 ----------
 
-    async def _render(self, payload: dict) -> str:
-        """将 payload 渲染为图片地址。"""
+    async def _render(self, payload: dict, template: str | None = None) -> str:
+        """将 payload 渲染为图片地址。template 省略时用名片卡模板。"""
         from astrbot.core import html_renderer
 
         return await html_renderer.render_custom_template(
-            load_template(), payload, return_url=True, options=RENDER_OPTIONS
+            template or load_template(),
+            payload,
+            return_url=True,
+            options=RENDER_OPTIONS,
         )
 
     # ---------- 白名单 ----------
@@ -299,6 +360,23 @@ class JX3MingpianPlugin(Star):
                 event, f"当前会话未绑定区服。发送「{BIND_COMMAND} 区服名」即可绑定。"
             )
 
+    @filter.regex(_command_pattern(HELP_COMMAND))
+    async def help_image(self, event: AstrMessageEvent):
+        """名片帮助：返回一张命令说明图。"""
+        if not self._allowed(event):
+            await self._send_text(event, DENIED_MESSAGE)
+            return
+
+        try:
+            url = await self._render(help_payload(), load_help_template())
+        except Exception as exc:
+            logger.exception("帮助图渲染失败")
+            await self._send_text(event, f"渲染帮助图失败：{exc}")
+            return
+
+        await self._send_result(event, event.image_result(url))
+        self._cleanup(url)
+
     @filter.regex(_command_pattern(COMMAND))
     async def mingpian_card(self, event: AstrMessageEvent):
         """名片卡 [服务器] 角色名 [序号]"""
@@ -342,6 +420,7 @@ class JX3MingpianPlugin(Star):
                 server=server,
                 name=name,
                 index=picked,
+                size=card_size(self.conf.get("mingpian_card_ratio")),
             )
         except (JX3APIError, ImageAPIError) as exc:
             await self._send_text(event, f"名片卡生成失败：{exc}")
@@ -435,7 +514,11 @@ class JX3MingpianPlugin(Star):
         self._active += 1
         try:
             source = await resolve_card(
-                self._jx3_client(), server=server, name=name, index=index
+                self._jx3_client(),
+                server=server,
+                name=name,
+                index=index,
+                with_detail=False,
             )
             image_bytes = await build_closeup(self._image_client(), source, prompt)
         except (JX3APIError, ImageAPIError) as exc:

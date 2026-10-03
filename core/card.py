@@ -26,7 +26,8 @@ from .mingpian_data import (
     sect_card_fields,
     sect_scene,
 )
-from .prompts import POSTER_SIZE, Prompt, render_prompt
+from .prompts import Prompt
+from .sizes import DEFAULT_CARD_RATIO, RATIO_SIZES, prompt_size
 
 logger = logging.getLogger("astrbot")
 
@@ -34,9 +35,10 @@ ASSET_ROOT = Path(__file__).resolve().parent.parent / "templates"
 FONT_DIR = ASSET_ROOT / "font"
 IMG_DIR = ASSET_ROOT / "img"
 
-# 名片卡出图尺寸。新增生图功能时，在各自的模块里声明自己的尺寸
-CARD_SIZE = "2048x1152"  # 无字底卡
-AVATAR_SIZE = "1024x1024"  # 正面头像
+# 名片卡默认出图尺寸。底图实际比例由配置项 mingpian_card_ratio 决定，
+# 这里只是调用方漏传时的兜底默认值
+CARD_SIZE = RATIO_SIZES[DEFAULT_CARD_RATIO]  # 无字底卡，默认 16:9
+AVATAR_SIZE = "1024x1024"  # 正面头像，固定 1:1
 
 
 def _data_uri(path: Path, mime: str) -> str:
@@ -87,10 +89,8 @@ def build_payload(
         "brushFont": brush_font_uri(),
         "logo": logo_uri(),
         # 底卡作为背景，文字、徽记与条码由模板叠加
-        "overlayMode": True,
         "bgImage": "data:image/png;base64,"
         + base64.b64encode(base_bytes).decode("ascii"),
-        "portrait": "",
         "avatar": "data:image/png;base64,"
         + base64.b64encode(avatar_bytes).decode("ascii"),
         "nickname": nickname,
@@ -137,8 +137,13 @@ async def resolve_card(
     server: str,
     name: str,
     index: int | None = None,
+    with_detail: bool = True,
 ) -> CardSource:
-    """取名片形象图与角色详情。index 省略时随机取一张，从 1 起。"""
+    """取名片形象图；with_detail 为真时再取一次角色详情。
+
+    index 省略时随机取一张，从 1 起。名片特写只用形象图，提示词里不含占位符时
+    无需再花一次令牌取角色信息。
+    """
     records = await jx3.card_records(server, name)
     if not records:
         raise JX3APIError(f"没拿到 {server} · {name} 的名片记录")
@@ -155,7 +160,7 @@ async def resolve_card(
     if not art:
         raise JX3APIError("名片形象图下载失败，请稍后再试")
 
-    detail = await jx3.role_detail(server, name)
+    detail = await jx3.role_detail(server, name) if with_detail else {}
     school = str(detail.get("forceName") or "").strip()
     accent, _ = sect_accent(school) if school else ("#8a6aa8", "#4a3560")
     return CardSource(
@@ -211,9 +216,11 @@ async def build_card(
     server: str,
     name: str,
     index: int | None = None,
+    size: str = CARD_SIZE,
 ) -> tuple[dict[str, Any], str]:
     """名片卡：取名片形象图，生成底卡与头像，组装模板 payload。
 
+    size 为底图尺寸，由调用方按配置的名片卡比例给出。
     失败时抛出 JX3APIError 或 ImageAPIError，message 可直接返回给用户。
     """
     if not image.configured:
@@ -226,7 +233,7 @@ async def build_card(
 
     # 底卡与头像并发生成
     base_result, avatar_result = await asyncio.gather(
-        generate_base(image, source, prompt),
+        generate_base(image, source, prompt, size=size),
         generate_avatar(image, source),
         return_exceptions=True,
     )
@@ -262,15 +269,10 @@ async def build_closeup(
 
     只传角色形象图，不传卡面样式参考：提示词描述的是纯海报，
     卡面版式（面板、齿孔、条码）不属于其中，作为参考图传入会干扰构图。
+    出图尺寸取该提示词自己配置的比例；未指定时交给接口决定。
     """
     if not image.configured:
         raise ImageAPIError("还没配置生图接口，请填写「生图接口地址 / 密钥 / 模型名」")
-    text = render_prompt(
-        prompt.text,
-        school=source.school or "剑网3",
-        scene=source.scene,
-        accent=source.accent,
-    )
     return await generate_base(
-        image, source, text, size=POSTER_SIZE, with_card_ref=False
+        image, source, prompt.text, size=prompt_size(prompt.ratio), with_card_ref=False
     )

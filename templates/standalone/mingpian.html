@@ -58,7 +58,7 @@
             position: absolute;
             inset: 0;
             background-size: cover;
-            background-position: {% if overlayMode %}50% 50%{% else %}50% 46%{% endif %};
+            background-position: 50% 50%;
             {% if bgImage %}
             background-image: url("{{ bgImage }}");
             {% else %}
@@ -71,40 +71,9 @@
             {% endif %}
         }
 
-        {% if overlayMode %}
-        /* 底卡打底模式：底卡与面板由生图生成，本层只负责文字与图形。
-           面板位置与尺寸由 panelShift / panelTop / panelHeight 传入，
-           右栏内容按传入的面板框居中。 */
-        .card__tint,
-        .card__frame {
-            display: none;
-        }
-        {% else %}
-        /* 无底卡时使用的整体压暗层 */
-        .card__tint {
-            position: absolute;
-            inset: 0;
-            background:
-                radial-gradient(ellipse 88% 125% at 50% 45%,
-                    rgba(0, 0, 0, 0) 38%,
-                    color-mix(in srgb, var(--accent-deep) 78%, #000) 100%),
-                color-mix(in srgb, var(--accent-deep) 30%, transparent);
-        }
-        {% endif %}
-
-        /* 整卡内缩点线框 */
-        .card__frame {
-            position: absolute;
-            inset: 15px;
-            border: 1px dotted color-mix(in srgb, var(--accent) 62%, transparent);
-            border-radius: 6px;
-            pointer-events: none;
-        }
-
-        /* 面板几何。边框仅在非打底模式下绘制 */
+        /* 面板几何：底卡与面板由生图生成，本层只做定位，不画边框 */
         .panel {
             position: absolute;
-            {% if not overlayMode %}border: 1px dotted color-mix(in srgb, var(--accent) 68%, transparent);{% endif %}
             border-radius: 5px;
         }
 
@@ -113,17 +82,16 @@
             top: 56px;
             width: 786px;
             height: 530px;
-            background: {% if overlayMode %}transparent{% else %}rgba(255, 255, 255, 0.13){% endif %};
+            background: transparent;
         }
 
         .panel--side {
             right: 44px;
-            top: {{ panelTop | default(46) }}px;
+            top: 46px;
             width: 300px;
-            height: {{ panelHeight | default(608) }}px;
-            background: {% if overlayMode %}transparent{% else %}color-mix(in srgb, var(--accent-deep) 62%, transparent){% endif %};
-            /* 按传入的面板框对齐：translateX 对齐水平中心，top/height 使用传入值，
-               内部元素按百分比定位 */
+            height: 608px;
+            background: transparent;
+            /* panelShift 微调水平位置，内部元素按百分比定位 */
             transform: translateX({{ panelShift | default(0) }}px);
         }
 
@@ -194,20 +162,6 @@
         .kv--body { left: 51px; top: 300px; }
         .kv--camp { left: 51px; top: 380px; }
         .kv--tong { left: 51px; top: 460px; }
-
-        /* 立绘：真实抠图（rembg 出来的带 alpha PNG）直接贴，像素不动。
-           只有用生图"重绘"出来的立绘才需要羽化融进背景，那种情况加 portraitMask。 */
-        .portrait {
-            position: absolute;
-            left: 51%;
-            bottom: 0;
-            height: 100%;
-            transform: translateX(-50%);
-            {% if portraitMask %}
-            -webkit-mask-image: radial-gradient(ellipse 56% 84% at 50% 48%, #000 50%, transparent 100%);
-            mask-image: radial-gradient(ellipse 56% 84% at 50% 48%, #000 50%, transparent 100%);
-            {% endif %}
-        }
 
         .side__emblem {
             position: absolute;
@@ -297,8 +251,6 @@
 <body>
     <div class="card">
         <div class="card__bg"></div>
-        <div class="card__tint"></div>
-        <div class="card__frame"></div>
 
         <div class="panel panel--info">
             {% if avatar %}
@@ -326,8 +278,6 @@
             <div class="kv kv--tong"><span class="kv__label">帮会</span><span class="kv__value">{{ tong | e }}</span></div>
             {% endif %}
         </div>
-
-        {% if portrait %}<img class="portrait" src="{{ portrait }}" alt="">{% endif %}
 
         <div class="panel panel--side">
             {% if schoolIcon %}<img class="side__emblem" src="{{ schoolIcon }}" alt="{{ school | e }}">{% endif %}

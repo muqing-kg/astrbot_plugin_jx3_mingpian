@@ -2,7 +2,7 @@
 
 本模块的请求经配置中的 HTTP 代理发出。生图请求不走该代理，见 core/image_api.py。
 
-令牌按配置原样使用，不做裁剪。
+令牌去掉首尾空白后使用。
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class JX3APIClient:
             raise JX3APIError("还没配置 JX3API 接口令牌")
 
         last_error = ""
-        for index, token in enumerate(self.tokens.order()):
+        for index, token in enumerate(self.tokens.take_order()):
             try:
                 data = await self._request(path, params, token)
             except JX3APIError as exc:
@@ -73,7 +73,6 @@ class JX3APIClient:
                     logger.warning("接口令牌不可用，改用下一条：%s", last_error)
                     continue
                 raise
-            self.tokens.mark_used(token)
             return data
         raise JX3APIError(last_error or "JX3API 请求失败")
 
@@ -115,6 +114,9 @@ class JX3APIClient:
             )
             if code in (401, 403):
                 raise JX3APIError(f"JX3API 令牌无效：{message}")
+            if code == 429:
+                # 文案需含「限流」，密钥池据此判断是否换下一条
+                raise JX3APIError(f"JX3API 限流：{message}")
             raise JX3APIError(f"JX3API 报错：{message}")
         return payload.get("data")
 
@@ -153,6 +155,9 @@ class JX3APIClient:
                     logger.error("名片形象图下载失败 %s: %s", response.status, url)
                     return None
                 return await response.read()
+        except asyncio.TimeoutError:
+            logger.error("名片形象图下载超时 %s", url)
+            return None
         except aiohttp.ClientError as exc:
             logger.error("名片形象图下载出错 %s: %s", url, exc)
             return None
