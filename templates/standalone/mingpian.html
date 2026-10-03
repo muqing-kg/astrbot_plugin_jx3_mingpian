@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <title>角色名片</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        {% if cardFont %}
+        @font-face {
+            font-family: "名片字体";
+            src: url("{{ cardFont }}") format("woff2");
+            font-display: block;
+        }
+        {% endif %}
+
+        {% if brushFont %}
+        @font-face {
+            font-family: "名片行楷";
+            src: url("{{ brushFont }}") format("truetype");
+            font-display: block;
+        }
+        {% endif %}
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            width: max-content;
+            margin: 0;
+            background: #fff;
+            font-family: "名片字体", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* 官方名片实际比例约 1.83:1（1255x685），这里取 1280x700 */
+        .card {
+            /* 门派配色：由 core/mingpian_data.py 从门派徽记取主色 */
+            --accent: {{ accent | default('#c9a0dc') }};
+            --accent-deep: {{ accentDeep | default('#3a2440') }};
+
+            position: relative;
+            width: 1280px;
+            height: 700px;
+            overflow: hidden;
+            border-radius: 10px;
+            background: linear-gradient(135deg,
+                    color-mix(in srgb, var(--accent-deep) 82%, #fff) 0%,
+                    var(--accent-deep) 58%,
+                    color-mix(in srgb, var(--accent-deep) 70%, #000) 100%);
+            color: #fff;
+        }
+
+        .card__bg {
+            position: absolute;
+            inset: 0;
+            background-size: cover;
+            background-position: {% if overlayMode %}50% 50%{% else %}50% 46%{% endif %};
+            {% if bgImage %}
+            background-image: url("{{ bgImage }}");
+            {% else %}
+            /* 没有门派底图时，退化成该门派的配色底，仍然是一张纯渲染的卡 */
+            background-image:
+                radial-gradient(ellipse 70% 110% at 22% 42%,
+                    color-mix(in srgb, var(--accent) 42%, transparent) 0%, transparent 62%),
+                radial-gradient(ellipse 70% 110% at 80% 50%,
+                    color-mix(in srgb, var(--accent) 32%, transparent) 0%, transparent 64%);
+            {% endif %}
+        }
+
+        {% if overlayMode %}
+        /* 底卡打底模式：底卡与面板由生图生成，本层只负责文字与图形。
+           面板位置与尺寸由 panelShift / panelTop / panelHeight 传入，
+           右栏内容按传入的面板框居中。 */
+        .card__tint,
+        .card__frame {
+            display: none;
+        }
+        {% else %}
+        /* 无底卡时使用的整体压暗层 */
+        .card__tint {
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(ellipse 88% 125% at 50% 45%,
+                    rgba(0, 0, 0, 0) 38%,
+                    color-mix(in srgb, var(--accent-deep) 78%, #000) 100%),
+                color-mix(in srgb, var(--accent-deep) 30%, transparent);
+        }
+        {% endif %}
+
+        /* 整卡内缩点线框 */
+        .card__frame {
+            position: absolute;
+            inset: 15px;
+            border: 1px dotted color-mix(in srgb, var(--accent) 62%, transparent);
+            border-radius: 6px;
+            pointer-events: none;
+        }
+
+        /* 面板几何。边框仅在非打底模式下绘制 */
+        .panel {
+            position: absolute;
+            {% if not overlayMode %}border: 1px dotted color-mix(in srgb, var(--accent) 68%, transparent);{% endif %}
+            border-radius: 5px;
+        }
+
+        .panel--info {
+            left: 46px;
+            top: 56px;
+            width: 786px;
+            height: 530px;
+            background: {% if overlayMode %}transparent{% else %}rgba(255, 255, 255, 0.13){% endif %};
+        }
+
+        .panel--side {
+            right: 44px;
+            top: {{ panelTop | default(46) }}px;
+            width: 300px;
+            height: {{ panelHeight | default(608) }}px;
+            background: {% if overlayMode %}transparent{% else %}color-mix(in srgb, var(--accent-deep) 62%, transparent){% endif %};
+            /* 按传入的面板框对齐：translateX 对齐水平中心，top/height 使用传入值，
+               内部元素按百分比定位 */
+            transform: translateX({{ panelShift | default(0) }}px);
+        }
+
+
+        /* 以下坐标按官方卡量取：卡 1255x685，本模板 1280x700（×1.0199）
+           头像圆心 (161,181) 直径 131 → 本模板 (97,118) 直径 134 */
+        .info__avatar {
+            position: absolute;
+            left: 51px;
+            top: 62px;
+            width: 134px;
+            height: 134px;
+            border-radius: 50%;
+            object-fit: cover;
+            /* 头像圈走门派色，各门派自动不同 */
+            border: 2px solid color-mix(in srgb, var(--accent) 88%, #fff);
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent),
+                        0 4px 14px rgba(40, 20, 40, 0.35);
+        }
+
+        .info__avatar--empty {
+            background: color-mix(in srgb, var(--accent) 26%, transparent);
+        }
+
+        /* 头像右侧：门派 + 等级；下一行服务器 */
+        .info__name {
+            position: absolute;
+            left: 205px;
+            top: 58px;
+            font-size: 34px;
+            letter-spacing: 3px;
+            text-shadow: 0 2px 8px rgba(60, 25, 55, 0.55);
+        }
+
+        .info__level {
+            margin-left: 12px;
+            font-size: 22px;
+            opacity: 0.92;
+        }
+
+        .kv {
+            position: absolute;
+            font-size: 23px;
+            letter-spacing: 1px;
+            text-shadow: 0 2px 8px rgba(60, 25, 55, 0.55);
+            white-space: nowrap;
+        }
+
+        .kv__label {
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .kv__value {
+            margin-left: 10px;
+            color: #fff;
+        }
+
+        .kv--server { left: 205px; top: 122px; }
+
+        /* 头像下方：昵称 / 体型 / 阵营 / 帮会 */
+        .kv--nick {
+            left: 51px;
+            top: 210px;
+            font-size: 30px;
+            letter-spacing: 2px;
+        }
+
+        .kv--body { left: 51px; top: 300px; }
+        .kv--camp { left: 51px; top: 380px; }
+        .kv--tong { left: 51px; top: 460px; }
+
+        /* 立绘：真实抠图（rembg 出来的带 alpha PNG）直接贴，像素不动。
+           只有用生图"重绘"出来的立绘才需要羽化融进背景，那种情况加 portraitMask。 */
+        .portrait {
+            position: absolute;
+            left: 51%;
+            bottom: 0;
+            height: 100%;
+            transform: translateX(-50%);
+            {% if portraitMask %}
+            -webkit-mask-image: radial-gradient(ellipse 56% 84% at 50% 48%, #000 50%, transparent 100%);
+            mask-image: radial-gradient(ellipse 56% 84% at 50% 48%, #000 50%, transparent 100%);
+            {% endif %}
+        }
+
+        .side__emblem {
+            position: absolute;
+            left: 50%;
+            top: 4.3%;
+            height: 84px;
+            transform: translateX(-50%);
+            object-fit: contain;
+            /* 官方名片上的门派徽记统一是白/浅色描边 */
+            filter: brightness(0) invert(1) opacity(0.95) drop-shadow(0 2px 8px rgba(60, 25, 55, 0.45));
+        }
+
+        .side__poem {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 21.7%;
+            display: flex;
+            flex-direction: row-reverse;
+            justify-content: center;
+            gap: 11px;
+        }
+
+        .side__poem-col {
+            writing-mode: vertical-rl;
+            text-orientation: upright;
+            font-family: "名片行楷", "STXingkai", "KaiTi", serif;
+            font-size: 21px;
+            line-height: 1.2;
+            letter-spacing: 2px;
+            text-shadow: 0 2px 8px rgba(60, 25, 55, 0.6);
+        }
+
+        /* 官方诗句是交错排布的 */
+        .side__poem-col:nth-child(even) {
+            margin-top: 46px;
+        }
+
+        .side__logo {
+            position: absolute;
+            left: 50%;
+            top: 67.8%;
+            height: 44px;
+            transform: translateX(-50%);
+            object-fit: contain;
+            /* 官方卡上的标识是浅色描边 */
+            filter: brightness(0) invert(1) opacity(0.9);
+        }
+
+        .side__date {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 78.0%;
+            text-align: center;
+            font-size: 17px;
+            letter-spacing: 2px;
+            color: rgba(255, 255, 255, 0.92);
+            text-shadow: 0 1px 6px rgba(60, 25, 55, 0.5);
+        }
+
+        .side__bars {
+            position: absolute;
+            left: 55px;
+            right: 55px;
+            top: 84.2%;
+            height: 46px;
+            padding: 3px 4px;
+            background: rgba(255, 255, 255, 0.94);
+            border-radius: 2px;
+        }
+
+        .side__bars-inner {
+            height: 100%;
+            background-image: repeating-linear-gradient(90deg,
+                    #2a1c28 0 2px, transparent 2px 5px,
+                    #2a1c28 5px 6px, transparent 6px 10px,
+                    #2a1c28 10px 14px, transparent 14px 15px,
+                    #2a1c28 15px 16px, transparent 16px 20px,
+                    #2a1c28 20px 24px, transparent 24px 25px,
+                    #2a1c28 25px 26px, transparent 26px 30px);
+        }
+
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <div class="card__bg"></div>
+        <div class="card__tint"></div>
+        <div class="card__frame"></div>
+
+        <div class="panel panel--info">
+            {% if avatar %}
+            <img class="info__avatar" src="{{ avatar }}" alt="">
+            {% else %}
+            <div class="info__avatar info__avatar--empty"></div>
+            {% endif %}
+
+            <div class="info__name">{{ school | e }}<span class="info__level">{{ level | e }}级</span></div>
+
+            {% if server %}
+            <div class="kv kv--server"><span class="kv__label">服务器</span><span class="kv__value">{{ server | e }}</span></div>
+            {% endif %}
+
+            {% if nickname %}
+            <div class="kv kv--nick">{{ nickname | e }}</div>
+            {% endif %}
+            {% if body %}
+            <div class="kv kv--body"><span class="kv__label">体型</span><span class="kv__value">{{ body | e }}</span></div>
+            {% endif %}
+            {% if camp %}
+            <div class="kv kv--camp"><span class="kv__label">阵营</span><span class="kv__value">{{ camp | e }}</span></div>
+            {% endif %}
+            {% if tong %}
+            <div class="kv kv--tong"><span class="kv__label">帮会</span><span class="kv__value">{{ tong | e }}</span></div>
+            {% endif %}
+        </div>
+
+        {% if portrait %}<img class="portrait" src="{{ portrait }}" alt="">{% endif %}
+
+        <div class="panel panel--side">
+            {% if schoolIcon %}<img class="side__emblem" src="{{ schoolIcon }}" alt="{{ school | e }}">{% endif %}
+
+            {% if poem %}
+            <div class="side__poem">
+                {% for column in poem %}
+                <div class="side__poem-col">{{ column | e }}</div>
+                {% endfor %}
+            </div>
+            {% endif %}
+
+            {% if logo %}<img class="side__logo" src="{{ logo }}" alt="">{% endif %}
+            <div class="side__date">{{ cardDate | e }}</div>
+            <div class="side__bars">
+                <div class="side__bars-inner"></div>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>

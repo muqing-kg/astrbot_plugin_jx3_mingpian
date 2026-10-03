@@ -1,0 +1,79 @@
+"""序号选择菜单：发送清单，等待发送人回复序号，超时执行第 1 项。"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+
+from astrbot.api.event import AstrMessageEvent
+from astrbot.core.utils.session_waiter import SessionController, session_waiter
+
+logger = logging.getLogger("astrbot")
+
+CHOICE_TIMEOUT = 15
+
+RunChoice = Callable[[int, AstrMessageEvent], Awaitable[None]]
+
+
+async def ask_choice(
+    event: AstrMessageEvent,
+    text: str,
+    count: int,
+    run: RunChoice,
+    *,
+    timeout: int = CHOICE_TIMEOUT,
+) -> None:
+    """发送清单 text，等待发送人回复 1..count 的序号。
+
+    只接受原发送人的回复；超时按第 1 项执行。
+    """
+    body = str(text).rstrip()
+    if "发送序号即可" not in body:
+        body += f"\n\n发送序号即可，{timeout} 秒后自动选 1"
+
+    await event.send(event.plain_result(body))
+
+    sender = event.get_sender_id()
+    resolved = False
+
+    async def fail(target: AstrMessageEvent, message: str) -> None:
+        await target.send(target.plain_result(message))
+
+    @session_waiter(timeout=timeout)
+    async def waiter(controller: SessionController, new_event: AstrMessageEvent):
+        nonlocal resolved
+        if new_event.get_sender_id() != sender:
+            return
+
+        raw = new_event.get_message_str().strip()
+        if raw.startswith("/"):
+            raw = raw[1:].strip()
+        if not raw.isdigit():
+            await fail(new_event, "输入异常，结束会话")
+            controller.stop()
+            return
+
+        choice = int(raw)
+        if choice < 1 or choice > count:
+            await fail(new_event, "无效序号，结束会话")
+            controller.stop()
+            return
+
+        resolved = True
+        try:
+            await run(choice, new_event)
+        except Exception:
+            logger.exception("选择后执行失败")
+        controller.stop()
+
+    try:
+        await waiter(event)
+    except TimeoutError:
+        if resolved:
+            return
+        try:
+            await run(1, event)
+        except Exception:
+            logger.exception("默认选项执行失败")
+    except Exception:
+        logger.exception("选择等待异常")
