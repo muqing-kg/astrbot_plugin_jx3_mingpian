@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -15,12 +16,16 @@ from aiohttp import FormData
 from astrbot.api.message_components import Image as _Image
 from astrbot.api.message_components import Plain as _Plain
 
-from core.access import DENIED_MESSAGE, is_allowed, load_whitelist
+from core.access import (
+    ADMIN_ONLY_MESSAGE,
+    DENIED_MESSAGE,
+    is_allowed,
+    load_whitelist,
+)
 from core.binding import BindingStore, parse_card_args
-from core.card import build_payload
+from core.card import AVATAR_SIZE, CARD_SIZE, build_payload
 from core.image_api import (
     DEFAULT_MODEL,
-    DEFAULT_POSTER_SIZE,
     ImageAPIClient,
     ImageAPIError,
     normalize_api_base,
@@ -39,12 +44,14 @@ from core.mingpian_data import (
 )
 from core.prompts import (
     DEFAULT_TASK_HINT,
+    POSTER_SIZE,
     Prompt,
     load_prompts,
     menu_text,
     render_prompt,
     task_hint,
 )
+from core.servers import OFFICIAL_SERVERS, canonical_server, server_list_text
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates" / "standalone" / "mingpian.html"
@@ -70,6 +77,12 @@ def _load_plugin_main():
 
 
 plugin_main = _load_plugin_main()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_binding_dir(tmp_path, monkeypatch):
+    """每个用例使用独立的绑定数据目录，避免用例之间互相影响。"""
+    monkeypatch.setattr(plugin_main, "_data_dir", lambda: tmp_path)
 
 
 class TestNormalizeApiBase:
@@ -639,11 +652,7 @@ class TestConfigSchema:
         item = self._schema()["mingpian_prompts"]
         assert item["type"] == "template_list"
         assert item["templates"]["prompt_item"]["display_item"] == "name"
-        assert set(item["templates"]["prompt_item"]["items"]) == {
-            "name",
-            "prompt",
-            "size",
-        }
+        assert set(item["templates"]["prompt_item"]["items"]) == {"name", "prompt"}
 
     def test_默认提示词可被解析(self):
         defaults = self._schema()["mingpian_prompts"]["default"]
@@ -935,7 +944,7 @@ class TestMultiKeyRotation:
             return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
 
         monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
-        assert await client.edit("提示词", [REF_IMAGE]) == b"png"
+        assert await client.edit("提示词", [REF_IMAGE], size=CARD_SIZE) == b"png"
         assert tried == ["bad", "good"]
 
     async def test_生图成功后游标前进(self, monkeypatch):
@@ -945,7 +954,7 @@ class TestMultiKeyRotation:
             return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
 
         monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
-        await client.edit("提示词", [REF_IMAGE])
+        await client.edit("提示词", [REF_IMAGE], size=CARD_SIZE)
         assert client.keys.order() == ["k2", "k1"]
 
     async def test_生图非凭据错误不换密钥(self, monkeypatch):
@@ -958,7 +967,7 @@ class TestMultiKeyRotation:
 
         monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
         with pytest.raises(ImageAPIError):
-            await client.edit("提示词", [REF_IMAGE])
+            await client.edit("提示词", [REF_IMAGE], size=CARD_SIZE)
         assert tried == ["k1"]
 
 
@@ -1056,7 +1065,7 @@ class TestWhitelistCommand:
     async def test_名片卡_名单内放行(self, monkeypatch):
         plugin = self._plugin(whitelist_enabled=True, whitelist=["u1"])
 
-        async def fake_build(jx3, image, *, server, name, index=None):
+        async def fake_build(jx3, image, *, server, name, index=None, size=None):
             return {"bgImage": "data:image/png;base64,AA=="}, "说明"
 
         monkeypatch.setattr(plugin_main, "build_card", fake_build)
@@ -1135,7 +1144,7 @@ class TestCardCommand:
         plugin = self._plugin()
         calls = {}
 
-        async def fake_build(jx3, image, *, server, name, index=None):
+        async def fake_build(jx3, image, *, server, name, index=None, size=None):
             calls.update(server=server, name=name, index=index)
             return {
                 "bgImage": "data:image/png;base64,AA=="
@@ -1266,19 +1275,202 @@ class TestDirectSend:
         assert "plain_result" not in source
 
 
-class TestPromptSize:
-    def test_条目带尺寸(self):
-        prompts = load_prompts([{"name": "甲", "prompt": "x", "size": "1024x1024"}])
-        assert prompts[0].size == "1024x1024"
+class TestServers:
+    @pytest.mark.parametrize("name", OFFICIAL_SERVERS)
+    def test_正式区服名可识别(self, name):
+        assert canonical_server(name) == name
 
-    def test_缺尺寸用默认(self):
-        prompts = load_prompts([{"name": "甲", "prompt": "x"}])
-        assert prompts[0].size == DEFAULT_POSTER_SIZE
+    @pytest.mark.parametrize(
+        "alias, expected",
+        [
+            ("念破", "破阵子"),
+            ("蝶服", "蝶恋花"),
+            ("姨妈", "斗转星移"),
+            ("华乾", "乾坤一掷"),
+            ("龙虎", "龙争虎斗"),
+            ("唯满侠", "唯我独尊"),
+            ("双梦", "梦江南"),
+        ],
+    )
+    def test_简称归一到正式名(self, alias, expected):
+        assert canonical_server(alias) == expected
 
-    def test_默认提示词都带尺寸(self):
+    @pytest.mark.parametrize("raw", ["", "  ", None, "不存在的服", "飞龙在天服"])
+    def test_未识别返回空(self, raw):
+        assert canonical_server(raw) == ""
+
+    def test_提示文本含全部区服(self):
+        text = server_list_text()
+        assert all(name in text for name in OFFICIAL_SERVERS)
+
+
+class TestBindCommand:
+    def _plugin(self, **conf):
+        base = {"jx3api_token": ["t"]}
+        base.update(conf)
+        return plugin_main.JX3MingpianPlugin(context=None, config=base)
+
+    def _event(self, msg, admin=True, umo="aiocqhttp:GroupMessage:1"):
+        event = _FakeEvent(msg=msg, umo=umo)
+        event.is_admin = lambda: admin
+        return event
+
+    async def test_绑定正式区服名(self):
+        plugin = self._plugin()
+        event = self._event("名片绑定 飞龙在天")
+        await plugin.bind_server(event)
+        assert event.texts == ["已为当前会话绑定区服：飞龙在天"]
+        assert plugin.bindings.get(event.unified_msg_origin) == "飞龙在天"
+
+    async def test_绑定简称归一(self):
+        plugin = self._plugin()
+        event = self._event("名片绑定 双梦")
+        await plugin.bind_server(event)
+        assert plugin.bindings.get(event.unified_msg_origin) == "梦江南"
+
+    async def test_再次绑定更换区服(self):
+        plugin = self._plugin()
+        first = self._event("名片绑定 飞龙在天")
+        await plugin.bind_server(first)
+        second = self._event("名片绑定 梦江南")
+        await plugin.bind_server(second)
+        assert second.texts == ["已将区服由 飞龙在天 更换为 梦江南"]
+        assert plugin.bindings.get(second.unified_msg_origin) == "梦江南"
+
+    async def test_重复绑定同一区服(self):
+        plugin = self._plugin()
+        await plugin.bind_server(self._event("名片绑定 飞龙在天"))
+        again = self._event("名片绑定 飞龙在天")
+        await plugin.bind_server(again)
+        assert again.texts == ["已为当前会话绑定区服：飞龙在天"]
+
+    async def test_错误区服名被拒(self):
+        plugin = self._plugin()
+        event = self._event("名片绑定 飞龙在")
+        await plugin.bind_server(event)
+        assert "未识别的区服" in event.texts[0]
+        assert plugin.bindings.get(event.unified_msg_origin) == ""
+
+    async def test_缺参数给用法(self):
+        plugin = self._plugin()
+        event = self._event("名片绑定")
+        await plugin.bind_server(event)
+        assert "用法" in event.texts[0]
+
+    async def test_非管理员被拒(self):
+        plugin = self._plugin()
+        event = self._event("名片绑定 飞龙在天", admin=False)
+        await plugin.bind_server(event)
+        assert event.texts == [ADMIN_ONLY_MESSAGE]
+        assert plugin.bindings.get(event.unified_msg_origin) == ""
+
+    async def test_查看已绑定(self):
+        plugin = self._plugin()
+        await plugin.bind_server(self._event("名片绑定 飞龙在天"))
+        event = self._event("查看名片区服")
+        await plugin.view_bind_server(event)
+        assert event.texts == ["当前会话绑定的区服：飞龙在天"]
+
+    async def test_查看未绑定(self):
+        plugin = self._plugin()
+        event = self._event("查看名片区服")
+        await plugin.view_bind_server(event)
+        assert "未绑定区服" in event.texts[0]
+
+    async def test_查看命令非管理员被拒(self):
+        plugin = self._plugin()
+        event = self._event("查看名片区服", admin=False)
+        await plugin.view_bind_server(event)
+        assert event.texts == [ADMIN_ONLY_MESSAGE]
+
+    async def test_绑定后命令可省略区服(self, monkeypatch):
+        plugin = self._plugin()
+        await plugin.bind_server(self._event("名片绑定 飞龙在天"))
+        seen = {}
+
+        async def fake_build(jx3, image, *, server, name, index=None, size=None):
+            seen["server"] = server
+            return {"bgImage": "data:image/png;base64,AA=="}, "n"
+
+        monkeypatch.setattr(plugin_main, "build_card", fake_build)
+        monkeypatch.setattr(
+            plugin_main.JX3MingpianPlugin,
+            "_render",
+            lambda self, payload: _async_value("http://img/card.png"),
+        )
+        event = self._event("名片卡 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert seen["server"] == "飞龙在天"
+
+
+class TestCleanup:
+    def test_删除本地文件(self, tmp_path):
+        target = tmp_path / "card.png"
+        target.write_bytes(b"x")
+        plugin_main.JX3MingpianPlugin._cleanup(str(target))
+        assert not target.exists()
+
+    def test_删除_file_协议路径(self, tmp_path):
+        target = tmp_path / "card.png"
+        target.write_bytes(b"x")
+        plugin_main.JX3MingpianPlugin._cleanup(target.as_uri())
+        assert not target.exists()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["", None, "http://img/card.png", "https://img/card.png", "base64://AAAA"],
+    )
+    def test_远程地址与空值跳过(self, value):
+        plugin_main.JX3MingpianPlugin._cleanup(value)
+
+    def test_不存在的路径不报错(self, tmp_path):
+        plugin_main.JX3MingpianPlugin._cleanup(str(tmp_path / "nope.png"))
+
+
+class TestSizes:
+    """尺寸写死在各自功能的模块里，调整时只改一处。"""
+
+    def test_名片卡尺寸(self):
+        assert CARD_SIZE == "2048x1152"
+        assert AVATAR_SIZE == "1024x1024"
+
+    def test_名片特写尺寸(self):
+        assert POSTER_SIZE == "2048x880"
+
+    def test_生图接口不设默认尺寸(self):
+        """size 为必填，避免调用方漏传时静默用错尺寸。"""
+        params = inspect.signature(ImageAPIClient.edit).parameters
+        assert params["size"].default is inspect.Parameter.empty
+
+    def test_配置里没有尺寸项(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-        for entry in schema["mingpian_prompts"]["default"]:
-            assert entry.get("size"), entry["name"]
+        assert "card_size" not in schema
+        items = schema["mingpian_prompts"]["templates"]["prompt_item"]["items"]
+        assert "size" not in items
+
+
+class TestNoPersist:
+    """生成内容不落盘：临时文件一律在 TemporaryDirectory 内，随用随清。"""
+
+    def test_每次写文件都在临时目录里(self):
+        text = (ROOT / "core" / "card.py").read_text(encoding="utf-8")
+        assert text.count("tempfile.TemporaryDirectory") == text.count(".write_bytes(")
+
+    def test_只有绑定数据持久化(self):
+        writers = [
+            path.name
+            for path in (ROOT / "core").glob("*.py")
+            if ".write_text(" in path.read_text(encoding="utf-8")
+        ]
+        assert writers == ["binding.py"]
+
+    def test_名片卡发送后清理渲染文件(self):
+        text = (ROOT / "main.py").read_text(encoding="utf-8")
+        assert "self._cleanup(url)" in text
+
+    def test_名片特写直接发_base64(self):
+        text = (ROOT / "main.py").read_text(encoding="utf-8")
+        assert "Comp.Image.fromBase64(" in text
 
 
 async def _async_value(value):

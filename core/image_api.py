@@ -32,11 +32,6 @@ DEFAULT_MODEL = "gpt-image-2.5"
 
 DEFAULT_TIMEOUT = 300
 
-# 名片卡底卡用的尺寸；生图接口接受的尺寸集合各家不同，这里只给默认值
-DEFAULT_CARD_SIZE = "2048x1152"
-# 21:9 横幅，名片特写的默认尺寸
-DEFAULT_POSTER_SIZE = "2048x880"
-
 
 class ImageAPIError(RuntimeError):
     """生图失败。message 为可直接返回给用户的文案。"""
@@ -210,11 +205,11 @@ class ImageAPIClient:
         prompt: str,
         images: Iterable[Path],
         *,
-        size: str = DEFAULT_CARD_SIZE,
+        size: str,
         quality: str = "high",
         retries: int = 1,
     ) -> bytes:
-        """带参考图生图。失败时按 retries 重试。"""
+        """带参考图生图。尺寸由调用方指定，失败时按 retries 重试。"""
         if not self.configured:
             raise ImageAPIError(
                 "还没配置生图接口，请填写「生图接口地址 / 密钥 / 模型名」"

@@ -21,13 +21,19 @@ import logging
 import re
 from functools import lru_cache
 from pathlib import Path
+from urllib.request import url2pathname
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .core.access import DENIED_MESSAGE, is_allowed, load_whitelist
+from .core.access import (
+    ADMIN_ONLY_MESSAGE,
+    DENIED_MESSAGE,
+    is_allowed,
+    load_whitelist,
+)
 from .core.binding import FILENAME as BINDING_FILE
 from .core.binding import BindingStore, parse_card_args
 from .core.card import build_card, build_closeup, resolve_card
@@ -37,6 +43,7 @@ from .core.keypool import KeyPool
 from .core.menu import CHOICE_TIMEOUT, ask_choice
 from .core.mingpian_data import parse_card_index
 from .core.prompts import Prompt, load_prompts, menu_text, task_hint
+from .core.servers import canonical_server, server_list_text
 
 logger = logging.getLogger("astrbot")
 
@@ -44,7 +51,8 @@ PLUGIN_NAME = "astrbot_plugin_jx3_mingpian"
 PLUGIN_VERSION = "1.0.0"
 COMMAND = "名片卡"
 CLOSEUP_COMMAND = "名片特写"
-BIND_COMMAND = "绑定"
+BIND_COMMAND = "名片绑定"
+VIEW_BIND_COMMAND = "查看名片区服"
 DEFAULT_CONCURRENT = 3
 TEMPLATE_PATH = (
     Path(__file__).resolve().parent / "templates" / "standalone" / "mingpian.html"
@@ -209,8 +217,30 @@ class JX3MingpianPlugin(Star):
         await self._send(event, Comp.Plain(text))
 
     async def _send_result(self, event: AstrMessageEvent, result) -> None:
-        """发送由 event.image_result 构造的结果，保留其自带的路径处理。"""
+        """发送由 event.image_result 构造的结果，发送后清理本地临时文件。"""
         await self._send(event, *(getattr(result, "chain", None) or []))
+
+    @staticmethod
+    def _cleanup(path: object) -> None:
+        """删除渲染产生的本地临时文件。远程地址与 base64 直接跳过。"""
+        text = str(path or "").strip()
+        if not text or text.startswith(("http://", "https://", "base64://")):
+            return
+        local = Path(url2pathname(text.removeprefix("file://")))
+        try:
+            if local.is_file():
+                local.unlink()
+        except OSError:
+            logger.warning("临时文件清理失败：%s", local)
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """是否为 AstrBot 管理员。"""
+        check = getattr(event, "is_admin", None)
+        try:
+            return bool(callable(check) and check())
+        except (AttributeError, TypeError, ValueError):
+            logger.debug("管理员判定失败，按非管理员处理")
+            return False
 
     def _bound_server(self, event: AstrMessageEvent) -> str:
         return self.bindings.get(getattr(event, "unified_msg_origin", ""))
@@ -219,21 +249,55 @@ class JX3MingpianPlugin(Star):
 
     @filter.regex(_command_pattern(BIND_COMMAND))
     async def bind_server(self, event: AstrMessageEvent):
-        """绑定 区服名"""
+        """名片绑定 区服名"""
         if not self._allowed(event):
             await self._send_text(event, DENIED_MESSAGE)
             return
+        if not self._is_admin(event):
+            await self._send_text(event, ADMIN_ONLY_MESSAGE)
+            return
+
         args = _split_args(event)
         if not args:
-            current = self._bound_server(event)
             await self._send_text(
-                event,
-                f"当前会话已绑定区服：{current}" if current else "用法：绑定 区服名",
+                event, f"用法：{BIND_COMMAND} 区服名\n{server_list_text()}"
             )
             return
-        server = " ".join(args).strip()
-        self.bindings.set(getattr(event, "unified_msg_origin", ""), server)
-        await self._send_text(event, f"已为当前会话绑定区服：{server}")
+
+        server = canonical_server(" ".join(args))
+        if not server:
+            await self._send_text(
+                event,
+                f"未识别的区服：{' '.join(args)}\n"
+                f"请填写完整区服名。\n{server_list_text()}",
+            )
+            return
+
+        umo = getattr(event, "unified_msg_origin", "")
+        previous = self._bound_server(event)
+        self.bindings.set(umo, server)
+        if previous and previous != server:
+            await self._send_text(event, f"已将区服由 {previous} 更换为 {server}")
+        else:
+            await self._send_text(event, f"已为当前会话绑定区服：{server}")
+
+    @filter.regex(_command_pattern(VIEW_BIND_COMMAND))
+    async def view_bind_server(self, event: AstrMessageEvent):
+        """查看名片区服"""
+        if not self._allowed(event):
+            await self._send_text(event, DENIED_MESSAGE)
+            return
+        if not self._is_admin(event):
+            await self._send_text(event, ADMIN_ONLY_MESSAGE)
+            return
+
+        current = self._bound_server(event)
+        if current:
+            await self._send_text(event, f"当前会话绑定的区服：{current}")
+        else:
+            await self._send_text(
+                event, f"当前会话未绑定区服。发送「{BIND_COMMAND} 区服名」即可绑定。"
+            )
 
     @filter.regex(_command_pattern(COMMAND))
     async def mingpian_card(self, event: AstrMessageEvent):
@@ -297,6 +361,7 @@ class JX3MingpianPlugin(Star):
             return
 
         await self._send_result(event, event.image_result(url))
+        self._cleanup(url)
 
     @filter.regex(_command_pattern(CLOSEUP_COMMAND))
     async def mingpian_closeup(self, event: AstrMessageEvent):

@@ -16,6 +16,7 @@ UMO 格式为 ``平台适配器ID:消息类型:会话ID``，其中消息类型�
 from __future__ import annotations
 
 DENIED_MESSAGE = "本命令仅限白名单用户使用。"
+ADMIN_ONLY_MESSAGE = "本命令仅限管理员使用。"
 
 
 def load_whitelist(raw: object) -> set[str]:

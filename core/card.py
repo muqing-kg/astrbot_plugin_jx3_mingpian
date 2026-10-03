@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .image_api import DEFAULT_CARD_SIZE, ImageAPIClient, ImageAPIError
+from .image_api import ImageAPIClient, ImageAPIError
 from .jx3api import JX3APIClient, JX3APIError
 from .mingpian_data import (
     AVATAR_PROMPT,
@@ -26,13 +26,17 @@ from .mingpian_data import (
     sect_card_fields,
     sect_scene,
 )
-from .prompts import Prompt, render_prompt
+from .prompts import POSTER_SIZE, Prompt, render_prompt
 
 logger = logging.getLogger("astrbot")
 
 ASSET_ROOT = Path(__file__).resolve().parent.parent / "templates"
 FONT_DIR = ASSET_ROOT / "font"
 IMG_DIR = ASSET_ROOT / "img"
+
+# 名片卡出图尺寸。新增生图功能时，在各自的模块里声明自己的尺寸
+CARD_SIZE = "2048x1152"  # 无字底卡
+AVATAR_SIZE = "1024x1024"  # 正面头像
 
 
 def _data_uri(path: Path, mime: str) -> str:
@@ -174,7 +178,7 @@ async def generate_base(
     source: CardSource,
     prompt: str,
     *,
-    size: str = DEFAULT_CARD_SIZE,
+    size: str = CARD_SIZE,
     with_card_ref: bool = True,
 ) -> bytes:
     """按提示词生成图片。
@@ -196,7 +200,7 @@ async def generate_avatar(image: ImageAPIClient, source: CardSource) -> bytes:
         art_path = Path(tmpdir) / "art.png"
         art_path.write_bytes(source.art)
         return await image.edit(
-            AVATAR_PROMPT, [art_path], size="1024x1024", quality="high"
+            AVATAR_PROMPT, [art_path], size=AVATAR_SIZE, quality="high"
         )
 
 
@@ -268,5 +272,5 @@ async def build_closeup(
         accent=source.accent,
     )
     return await generate_base(
-        image, source, text, size=prompt.size, with_card_ref=False
+        image, source, text, size=POSTER_SIZE, with_card_ref=False
     )
