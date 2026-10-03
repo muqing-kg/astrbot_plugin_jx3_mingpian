@@ -30,6 +30,7 @@ from .core.access import DENIED_MESSAGE, is_allowed, load_whitelist
 from .core.card import build_card, build_closeup, resolve_card
 from .core.image_api import ImageAPIClient, ImageAPIError, normalize_api_base
 from .core.jx3api import JX3APIClient, JX3APIError
+from .core.keypool import KeyPool
 from .core.menu import CHOICE_TIMEOUT, ask_choice
 from .core.mingpian_data import parse_card_index
 from .core.prompts import Prompt, load_prompts, menu_text, task_hint
@@ -92,12 +93,24 @@ class JX3MingpianPlugin(Star):
         self.conf = config
         # 当前正在生成的任务数
         self._active = 0
+        # 密钥池在请求之间共享，轮询位置才不会被重置
+        self._token_pool = KeyPool(self._list("jx3api_token"))
+        self._image_key_pool = KeyPool(self._list("image_api_key"))
         logger.info("%s 初始化完成（同时生成上限 %d）", PLUGIN_NAME, self._limit())
 
     # ---------- 配置 ----------
 
     def _text(self, key: str, default: str = "") -> str:
         return str(self.conf.get(key) or default).strip()
+
+    def _list(self, key: str) -> list[str]:
+        """读取列表型配置项，忽略空项。"""
+        raw = self.conf.get(key)
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [text for item in raw if (text := str(item or "").strip())]
 
     def _limit(self) -> int:
         """同时生成上限。取自 image_api_max_concurrent，默认 3，取值范围 1~20。"""
@@ -109,21 +122,24 @@ class JX3MingpianPlugin(Star):
         return max(1, min(number, 20))
 
     def _jx3_client(self) -> JX3APIClient:
+        # 按当前配置刷新密钥内容，游标保留
+        self._token_pool.sync(self._list("jx3api_token"))
         return JX3APIClient(
             base_url=self._text("jx3api_base_url", "https://www.jx3api.com"),
-            token=self._text("jx3api_token"),
+            token=self._token_pool,
             proxy=self._text("proxy"),
             ssl_verify=bool(self.conf.get("jx3api_ssl_verify", True)),
         )
 
     def _image_client(self) -> ImageAPIClient:
+        self._image_key_pool.sync(self._list("image_api_key"))
         try:
             base = normalize_api_base(self._text("image_api_base_url"))
         except ValueError:
             base = ""
         return ImageAPIClient(
             base_url=base,
-            api_key=self._text("image_api_key"),
+            api_key=self._image_key_pool,
             model=self._text("image_api_model", "gpt-image-2.5"),
         )
 
@@ -140,11 +156,12 @@ class JX3MingpianPlugin(Star):
     # ---------- 白名单 ----------
 
     def _allowed(self, event: AstrMessageEvent) -> bool:
-        """当前发送者是否在白名单内。白名单未启用时一律放行。"""
+        """当前发送者或其所在会话是否在白名单内。白名单未启用时一律放行。"""
         return is_allowed(
             self.conf.get("whitelist_enabled"),
             load_whitelist(self.conf.get("whitelist")),
             event.get_sender_id(),
+            getattr(event, "unified_msg_origin", ""),
         )
 
     # ---------- 命令 ----------

@@ -6,9 +6,10 @@
   },
   "jx3api_token": {
     "description": "JX3API 接口令牌",
-    "type": "string",
-    "default": "",
-    "hint": "请前往 https://www.jx3api.com 购买"
+    "type": "list",
+    "default": [],
+    "secret": true,
+    "hint": "请前往 https://www.jx3api.com 购买。可填多条，按顺序轮询使用，一条失败自动换下一条"
   },
   "proxy": {
     "description": "国内 HTTP 代理地址",
@@ -29,8 +30,10 @@
   },
   "image_api_key": {
     "description": "生图接口密钥",
-    "type": "string",
-    "default": ""
+    "type": "list",
+    "default": [],
+    "secret": true,
+    "hint": "可填多条，按顺序轮询使用，一条失败自动换下一条"
   },
   "image_api_model": {
     "description": "生图模型名",
@@ -95,12 +98,12 @@
     "description": "启用白名单",
     "type": "bool",
     "default": false,
-    "hint": "启用后仅白名单内的用户可以使用本插件命令"
+    "hint": "启用后仅白名单内的用户或会话可以使用本插件命令"
   },
   "whitelist": {
-    "description": "白名单用户",
+    "description": "白名单",
     "type": "list",
     "default": [],
-    "hint": "填写发送者的用户 ID，一行一个。启用白名单后，仅这些用户可以使用命令"
+    "hint": "一项一条。填用户 ID 表示允许该用户；填统一消息来源（如 aiocqhttp:GroupMessage:123456789）表示允许该会话内的所有用户"
   }
 }

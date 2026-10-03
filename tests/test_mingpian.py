@@ -19,7 +19,8 @@ from core.image_api import (
     ImageAPIError,
     normalize_api_base,
 )
-from core.jx3api import JX3APIClient
+from core.jx3api import JX3APIClient, JX3APIError
+from core.keypool import KeyPool
 from core.mingpian_data import (
     BASE_PROMPT,
     SECT_POEMS,
@@ -40,6 +41,8 @@ from core.prompts import (
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates" / "standalone" / "mingpian.html"
+# 生图接口需要一张真实存在的参考图，内容无所谓
+REF_IMAGE = ROOT / "templates" / "img" / "剑网3标识.png"
 
 # 插件用相对导入（from .core.card import ...），必须按「包」加载；
 # 直接 import main 会报 "attempted relative import with no known parent package"。
@@ -144,7 +147,7 @@ class TestApiContract:
 
     def test_两条接口请求都带令牌(self):
         source = (ROOT / "core" / "jx3api.py").read_text(encoding="utf-8")
-        assert 'query = {**params, "token": self.token}' in source
+        assert 'query = {**params, "token": token}' in source
 
     def test_图片下载不带令牌(self):
         source = (ROOT / "core" / "jx3api.py").read_text(encoding="utf-8")
@@ -736,6 +739,167 @@ class TestCloseupCommand:
         assert event.texts[0] == "排队中，请稍候"
 
 
+class TestKeyPool:
+    def test_单条字符串按一条处理(self):
+        assert KeyPool("k1").keys == ["k1"]
+        assert len(KeyPool("k1")) == 1
+
+    @pytest.mark.parametrize("raw", [None, "", [], ["", "  "], [None]])
+    def test_空来源视为无密钥(self, raw):
+        pool = KeyPool(raw)
+        assert not pool
+        assert pool.order() == []
+
+    def test_忽略空项与前后空白(self):
+        assert KeyPool([" k1 ", "", "k2", None]).keys == ["k1", "k2"]
+
+    def test_从副本构造保留游标(self):
+        pool = KeyPool(["k1", "k2", "k3"])
+        pool.mark_used("k2")
+        copy = KeyPool(pool)
+        assert copy.order() == ["k3", "k1", "k2"]
+
+    def test_轮询顺序随游标推进(self):
+        pool = KeyPool(["k1", "k2", "k3"])
+        assert pool.order() == ["k1", "k2", "k3"]
+        pool.mark_used("k1")
+        assert pool.order() == ["k2", "k3", "k1"]
+        pool.mark_used("k3")
+        assert pool.order() == ["k1", "k2", "k3"]
+
+    def test_标记未知密钥不改变游标(self):
+        pool = KeyPool(["k1", "k2"])
+        pool.mark_used("unknown")
+        assert pool.order() == ["k1", "k2"]
+
+    def test_sync_保留游标位置(self):
+        pool = KeyPool(["k1", "k2", "k3"])
+        pool.mark_used("k2")
+        pool.sync(["k1", "k2", "k3"])
+        assert pool.order() == ["k3", "k1", "k2"]
+
+    def test_sync_缩短后游标取模(self):
+        pool = KeyPool(["k1", "k2", "k3"])
+        pool.mark_used("k3")
+        pool.sync(["k1", "k2"])
+        assert pool.order() in (["k1", "k2"], ["k2", "k1"])
+
+    def test_sync_清空后无密钥(self):
+        pool = KeyPool(["k1", "k2"])
+        pool.sync([])
+        assert not pool and pool.order() == []
+
+    @pytest.mark.parametrize(
+        "message, expected",
+        [
+            ("生图密钥被拒绝（HTTP 401）：bad", True),
+            ("JX3API 令牌无效：expired", True),
+            ("生图接口限流或额度不足（HTTP 429）：slow", True),
+            ("生图超时（300 秒），请稍后再试", False),
+            ("生图接口地址或模型名不对（HTTP 404）：nf", False),
+        ],
+    )
+    def test_判定是否值得换密钥(self, message, expected):
+        assert KeyPool.is_credential_failure(message) is expected
+
+
+class TestMultiKeyRotation:
+    """多条密钥时按轮询顺序使用，凭据类失败自动换下一条。"""
+
+    def _client(self, tokens):
+        return JX3APIClient("https://www.jx3api.com", tokens)
+
+    async def test_第一条失败换下一条(self, monkeypatch):
+        client = self._client(["bad", "good"])
+        tried = []
+
+        async def fake_request(self, path, params, token):
+            tried.append(token)
+            if token == "bad":
+                raise JX3APIError("JX3API 令牌无效：expired")
+            return {"ok": token}
+
+        monkeypatch.setattr(JX3APIClient, "_request", fake_request)
+        assert await client._get("/role/detail", {}) == {"ok": "good"}
+        assert tried == ["bad", "good"]
+
+    async def test_成功后游标前进(self, monkeypatch):
+        client = self._client(["k1", "k2"])
+
+        async def fake_request(self, path, params, token):
+            return {"ok": token}
+
+        monkeypatch.setattr(JX3APIClient, "_request", fake_request)
+        await client._get("/role/detail", {})
+        assert client.tokens.order() == ["k2", "k1"]
+
+    async def test_非凭据类错误直接抛出(self, monkeypatch):
+        client = self._client(["k1", "k2"])
+        tried = []
+
+        async def fake_request(self, path, params, token):
+            tried.append(token)
+            raise JX3APIError("JX3API 请求超时（30 秒）")
+
+        monkeypatch.setattr(JX3APIClient, "_request", fake_request)
+        with pytest.raises(JX3APIError):
+            await client._get("/role/detail", {})
+        assert tried == ["k1"]
+
+    async def test_全部失败时报最后一条错误(self, monkeypatch):
+        client = self._client(["k1", "k2"])
+
+        async def fake_request(self, path, params, token):
+            raise JX3APIError(f"JX3API 令牌无效：{token}")
+
+        monkeypatch.setattr(JX3APIClient, "_request", fake_request)
+        with pytest.raises(JX3APIError, match="k2"):
+            await client._get("/role/detail", {})
+
+    def test_单条密钥仍可用(self):
+        assert self._client("only").configured is True
+
+    def test_无密钥视为未配置(self):
+        assert self._client([]).configured is False
+
+    async def test_生图第一条失败换下一条(self, monkeypatch):
+        client = ImageAPIClient("https://hub.example.com", ["bad", "good"])
+        tried = []
+
+        async def fake_post(self, url, key, *, form):
+            tried.append(key)
+            if key == "bad":
+                raise ImageAPIError("生图密钥被拒绝（HTTP 401）：bad key")
+            return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        assert await client.edit("提示词", [REF_IMAGE]) == b"png"
+        assert tried == ["bad", "good"]
+
+    async def test_生图成功后游标前进(self, monkeypatch):
+        client = ImageAPIClient("https://hub.example.com", ["k1", "k2"])
+
+        async def fake_post(self, url, key, *, form):
+            return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        await client.edit("提示词", [REF_IMAGE])
+        assert client.keys.order() == ["k2", "k1"]
+
+    async def test_生图非凭据错误不换密钥(self, monkeypatch):
+        client = ImageAPIClient("https://hub.example.com", ["k1", "k2"])
+        tried = []
+
+        async def fake_post(self, url, key, *, form):
+            tried.append(key)
+            raise ImageAPIError("生图接口地址或模型名不对（HTTP 404）：nf")
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        with pytest.raises(ImageAPIError):
+            await client.edit("提示词", [REF_IMAGE])
+        assert tried == ["k1"]
+
+
 class TestWhitelist:
     def test_未启用时放行(self):
         assert is_allowed(False, {"u1"}, "u2") is True
@@ -750,6 +914,47 @@ class TestWhitelist:
 
     def test_编号前后空白被忽略(self):
         assert is_allowed(True, load_whitelist([" u1 ", ""]), "u1") is True
+
+    # --- UMO ---
+
+    def test_UMO_命中整个会话(self):
+        umo = "aiocqhttp:GroupMessage:987654321"
+        assert is_allowed(True, {umo}, "u9", umo) is True
+
+    def test_UMO_不匹配其他会话(self):
+        allowed = {"aiocqhttp:GroupMessage:987654321"}
+        assert (
+            is_allowed(True, allowed, "u9", "aiocqhttp:GroupMessage:111111111") is False
+        )
+
+    def test_UMO_区分消息类型(self):
+        allowed = {"aiocqhttp:GroupMessage:123"}
+        assert is_allowed(True, allowed, "u9", "aiocqhttp:FriendMessage:123") is False
+
+    def test_UMO_区分平台(self):
+        allowed = {"aiocqhttp:GroupMessage:123"}
+        assert is_allowed(True, allowed, "u9", "telegram:GroupMessage:123") is False
+
+    def test_用户ID与UMO可混用(self):
+        allowed = {"u1", "aiocqhttp:GroupMessage:987654321"}
+        assert is_allowed(True, allowed, "u1", "aiocqhttp:FriendMessage:1") is True
+        assert (
+            is_allowed(True, allowed, "u9", "aiocqhttp:GroupMessage:987654321") is True
+        )
+        assert is_allowed(True, allowed, "u9", "aiocqhttp:GroupMessage:222") is False
+
+    def test_UMO_条目不会被当成用户ID(self):
+        umo = "aiocqhttp:GroupMessage:987654321"
+        assert is_allowed(True, {umo}, umo, "") is False
+
+    def test_事件无UMO属性时不报错(self):
+        class Bare:
+            pass
+
+        assert (
+            is_allowed(True, {"u1"}, "u1", getattr(Bare(), "unified_msg_origin", ""))
+            is True
+        )
 
     @pytest.mark.parametrize(
         "raw, expected",

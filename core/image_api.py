@@ -24,6 +24,8 @@ from pathlib import Path
 import aiohttp
 from aiohttp import ClientTimeout, FormData
 
+from .keypool import KeyPool
+
 logger = logging.getLogger("astrbot")
 
 DEFAULT_MODEL = "gpt-image-2.5"
@@ -64,34 +66,34 @@ class ImageAPIClient:
     def __init__(
         self,
         base_url: str = "",
-        api_key: str = "",
+        api_key: str | KeyPool | Iterable[str] = "",
         model: str = DEFAULT_MODEL,
         *,
         ssl_verify: bool = True,
         timeout: int = DEFAULT_TIMEOUT,
     ):
         self.base_url = normalize_api_base(base_url)
-        self.api_key = str(api_key or "").strip()
+        self.keys = api_key if isinstance(api_key, KeyPool) else KeyPool(api_key)
         self.model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         self.ssl_verify = bool(ssl_verify)
         self.timeout = int(timeout)
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.api_key and self.model)
+        return bool(self.base_url and self.keys and self.model)
 
     def endpoint(self, kind: str) -> str:
         """kind: generations / edits"""
         return f"{self.base_url}/images/{kind}"
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, key: str) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {key}",
             "User-Agent": "astrbot-jx3-mingpian",
             "Accept": "application/json",
         }
 
-    async def _post(self, url: str, *, form: FormData) -> dict:
+    async def _post(self, url: str, key: str, *, form: FormData) -> dict:
         timeout = ClientTimeout(total=self.timeout, sock_read=self.timeout)
         try:
             # 不传 proxy：生图与 JX3API 的代理配置相互独立
@@ -99,7 +101,7 @@ class ImageAPIClient:
                 aiohttp.ClientSession(timeout=timeout) as session,
                 session.post(
                     url,
-                    headers=self._headers(),
+                    headers=self._headers(key),
                     data=form,
                     ssl=self.ssl_verify,
                 ) as response,
@@ -184,38 +186,50 @@ class ImageAPIClient:
         if not paths:
             raise ImageAPIError("edit 至少需要一张参考图")
 
+        order = self.keys.order()
         last_error = ""
-        for attempt in range(retries + 1):
-            form = FormData()
-            form.add_field("model", self.model)
-            form.add_field("prompt", prompt)
-            form.add_field("size", size if size in VALID_SIZES else "auto")
-            form.add_field("quality", quality)
-            form.add_field("n", "1")
-            for path in paths:
-                form.add_field(
-                    "image[]",
-                    path.read_bytes(),
-                    filename=path.name,
-                    content_type="image/png"
-                    if path.suffix.lower() == ".png"
-                    else "image/jpeg",
+        for key_index, key in enumerate(order):
+            # 每条密钥先按 retries 重试，仍失败则换下一条
+            for attempt in range(retries + 1):
+                form = FormData()
+                form.add_field("model", self.model)
+                form.add_field("prompt", prompt)
+                form.add_field("size", size if size in VALID_SIZES else "auto")
+                form.add_field("quality", quality)
+                form.add_field("n", "1")
+                for path in paths:
+                    form.add_field(
+                        "image[]",
+                        path.read_bytes(),
+                        filename=path.name,
+                        content_type="image/png"
+                        if path.suffix.lower() == ".png"
+                        else "image/jpeg",
+                    )
+                logger.info(
+                    "生图请求 %s model=%s size=%s 参考图 %d 张（密钥 %d/%d，第 %d 次）",
+                    self.endpoint("edits"),
+                    self.model,
+                    size,
+                    len(paths),
+                    key_index + 1,
+                    len(order),
+                    attempt + 1,
                 )
-            logger.info(
-                "生图请求 %s model=%s size=%s 参考图 %d 张（第 %d 次）",
-                self.endpoint("edits"),
-                self.model,
-                size,
-                len(paths),
-                attempt + 1,
-            )
-            try:
-                payload = await self._post(self.endpoint("edits"), form=form)
-                return self._pick_image(payload)
-            except ImageAPIError as exc:
-                last_error = str(exc)
-                if attempt >= retries or self._is_stable_failure(last_error):
-                    break
-                logger.warning("生图失败，重试一次：%s", last_error)
-                await asyncio.sleep(1.5)
+                try:
+                    payload = await self._post(self.endpoint("edits"), key, form=form)
+                    self.keys.mark_used(key)
+                    return self._pick_image(payload)
+                except ImageAPIError as exc:
+                    last_error = str(exc)
+                    if self._is_stable_failure(last_error):
+                        break
+                    if attempt >= retries:
+                        break
+                    logger.warning("生图失败，重试一次：%s", last_error)
+                    await asyncio.sleep(1.5)
+            if key_index + 1 < len(order) and KeyPool.is_credential_failure(last_error):
+                logger.warning("生图密钥不可用，改用下一条：%s", last_error)
+                continue
+            break
         raise ImageAPIError(last_error or "生图失败")

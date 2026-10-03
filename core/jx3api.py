@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 import aiohttp
 from aiohttp import ClientTimeout
+
+from .keypool import KeyPool
 
 logger = logging.getLogger("astrbot")
 
@@ -30,10 +33,12 @@ class JX3APIError(RuntimeError):
 
 
 class JX3APIClient:
+    """JX3API 客户端。token 可传单条或密钥池，池内按轮询顺序使用。"""
+
     def __init__(
         self,
         base_url: str = DEFAULT_BASE_URL,
-        token: str = "",
+        token: str | KeyPool | Iterable[str] = "",
         *,
         proxy: str = "",
         ssl_verify: bool = True,
@@ -42,19 +47,38 @@ class JX3APIClient:
         self.base_url = (
             str(base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
         )
-        self.token = str(token or "").strip()
+        self.tokens = token if isinstance(token, KeyPool) else KeyPool(token)
         self.proxy = str(proxy or "").strip()
         self.ssl_verify = bool(ssl_verify)
         self.timeout = int(timeout)
 
     @property
     def configured(self) -> bool:
-        return bool(self.token)
+        return bool(self.tokens)
 
     async def _get(self, path: str, params: dict) -> Any:
         if not self.configured:
             raise JX3APIError("还没配置 JX3API 接口令牌")
-        query = {**params, "token": self.token}
+
+        last_error = ""
+        for index, token in enumerate(self.tokens.order()):
+            try:
+                data = await self._request(path, params, token)
+            except JX3APIError as exc:
+                last_error = str(exc)
+                # 换一条密钥可能成功；其余错误直接抛出
+                if not KeyPool.is_credential_failure(last_error):
+                    raise
+                if index + 1 < len(self.tokens):
+                    logger.warning("接口令牌不可用，改用下一条：%s", last_error)
+                    continue
+                raise
+            self.tokens.mark_used(token)
+            return data
+        raise JX3APIError(last_error or "JX3API 请求失败")
+
+    async def _request(self, path: str, params: dict, token: str) -> Any:
+        query = {**params, "token": token}
         url = f"{self.base_url}{path}"
         timeout = ClientTimeout(total=self.timeout, sock_read=self.timeout)
         try:
