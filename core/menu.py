@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Plain
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 logger = logging.getLogger("astrbot")
@@ -31,13 +32,16 @@ async def ask_choice(
     if "发送序号即可" not in body:
         body += f"\n\n发送序号即可，{timeout} 秒后自动选 1"
 
-    await event.send(event.plain_result(body))
+    # 直发消息链：不经 AstrBot 结果装饰，避免附加引用与 @
+    await event.send(MessageChain(chain=[Plain(body)]))
+    event.stop_event()
 
     sender = event.get_sender_id()
     resolved = False
 
     async def fail(target: AstrMessageEvent, message: str) -> None:
-        await target.send(target.plain_result(message))
+        await target.send(MessageChain(chain=[Plain(message)]))
+        target.stop_event()
 
     @session_waiter(timeout=timeout)
     async def waiter(controller: SessionController, new_event: AstrMessageEvent):

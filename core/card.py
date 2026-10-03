@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .image_api import ImageAPIClient, ImageAPIError
+from .image_api import DEFAULT_CARD_SIZE, ImageAPIClient, ImageAPIError
 from .jx3api import JX3APIClient, JX3APIError
 from .mingpian_data import (
     AVATAR_PROMPT,
@@ -26,7 +26,7 @@ from .mingpian_data import (
     sect_card_fields,
     sect_scene,
 )
-from .prompts import render_prompt
+from .prompts import Prompt, render_prompt
 
 logger = logging.getLogger("astrbot")
 
@@ -174,7 +174,7 @@ async def generate_base(
     source: CardSource,
     prompt: str,
     *,
-    size: str = "2048x1152",
+    size: str = DEFAULT_CARD_SIZE,
     with_card_ref: bool = True,
 ) -> bytes:
     """按提示词生成图片。
@@ -252,7 +252,7 @@ async def build_card(
 async def build_closeup(
     image: ImageAPIClient,
     source: CardSource,
-    prompt_text: str,
+    prompt: Prompt,
 ) -> bytes:
     """名片特写：按配置的提示词生成图片，不做文字叠加。
 
@@ -261,10 +261,12 @@ async def build_closeup(
     """
     if not image.configured:
         raise ImageAPIError("还没配置生图接口，请填写「生图接口地址 / 密钥 / 模型名」")
-    prompt = render_prompt(
-        prompt_text,
+    text = render_prompt(
+        prompt.text,
         school=source.school or "剑网3",
         scene=source.scene,
         accent=source.accent,
     )
-    return await generate_base(image, source, prompt, with_card_ref=False)
+    return await generate_base(
+        image, source, text, size=prompt.size, with_card_ref=False
+    )

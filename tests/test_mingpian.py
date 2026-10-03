@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import re
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from aiohttp import FormData
+from astrbot.api.message_components import Image as _Image
+from astrbot.api.message_components import Plain as _Plain
 
 from core.access import DENIED_MESSAGE, is_allowed, load_whitelist
+from core.binding import BindingStore, parse_card_args
 from core.card import build_payload
 from core.image_api import (
     DEFAULT_MODEL,
+    DEFAULT_POSTER_SIZE,
     ImageAPIClient,
     ImageAPIError,
     normalize_api_base,
@@ -33,6 +39,7 @@ from core.mingpian_data import (
 )
 from core.prompts import (
     DEFAULT_TASK_HINT,
+    Prompt,
     load_prompts,
     menu_text,
     render_prompt,
@@ -99,15 +106,35 @@ class TestImageClient:
     def test_模型名缺省(self):
         assert ImageAPIClient("https://h/v1", "k", "").model == DEFAULT_MODEL
 
-    def test_取_b64_图片(self):
+    def _client(self):
+        return ImageAPIClient("https://h/v1", "k", "m")
+
+    async def test_取_b64_图片(self):
         blob = b"\x89PNG-fake"
         payload = {"data": [{"b64_json": base64.b64encode(blob).decode()}]}
-        assert ImageAPIClient._pick_image(payload) == blob
+        assert await self._client()._extract_image(payload) == blob
 
-    @pytest.mark.parametrize("payload", [{}, {"data": []}, {"data": [{"url": "u"}]}])
-    def test_没有可用图片就报错(self, payload):
+    async def test_取_data_uri_图片(self):
+        blob = b"\x89PNG-fake"
+        encoded = base64.b64encode(blob).decode()
+        payload = {"data": [{"b64_json": f"data:image/png;base64,{encoded}"}]}
+        assert await self._client()._extract_image(payload) == blob
+
+    async def test_下载_url_图片(self, monkeypatch):
+        blob = b"\x89PNG-from-url"
+        client = self._client()
+
+        async def fake_fetch(self, url):
+            return blob
+
+        monkeypatch.setattr(ImageAPIClient, "_fetch_image", fake_fetch)
+        payload = {"data": [{"url": "https://x/a.png"}]}
+        assert await client._extract_image(payload) == blob
+
+    @pytest.mark.parametrize("payload", [{}, {"data": []}, {"data": [{"nothing": 1}]}])
+    async def test_没有可用图片就报错(self, payload):
         with pytest.raises(ImageAPIError):
-            ImageAPIClient._pick_image(payload)
+            await self._client()._extract_image(payload)
 
     @pytest.mark.parametrize(
         "status, keyword",
@@ -285,22 +312,23 @@ class TestPayload:
 
 
 class _FakeEvent:
-    def __init__(self, sender: str = "u1", msg: str = ""):
-        self.sent: list = []
+    """假事件。send 收下的都是 MessageChain，按组件类型取出文本与图片。"""
+
+    def __init__(self, sender: str = "u1", msg: str = "", umo: str = ""):
+        self.sent: list[list] = []
         self._sender = sender
         self._msg = msg
+        self.unified_msg_origin = umo
+        self.stopped = False
 
     def plain_result(self, text):
-        return ("text", text)
+        return types.SimpleNamespace(chain=[_Plain(text)])
 
     def image_result(self, url):
-        return ("image", url)
-
-    def chain_result(self, chain):
-        return ("chain", chain)
+        return types.SimpleNamespace(chain=[_Image(url)])
 
     async def send(self, result):
-        self.sent.append(result)
+        self.sent.append(list(getattr(result, "chain", None) or []))
 
     def get_sender_id(self):
         return self._sender
@@ -309,22 +337,29 @@ class _FakeEvent:
         return self._msg
 
     @property
+    def message_str(self):
+        return self._msg
+
+    def stop_event(self):
+        self.stopped = True
+
+    @property
     def texts(self) -> list[str]:
-        return [item[1] for item in self.sent if item[0] == "text"]
+        return [
+            comp.text
+            for chain in self.sent
+            for comp in chain
+            if getattr(comp, "text", None) is not None
+        ]
 
     @property
     def images(self) -> list[str]:
-        out: list[str] = []
-        for kind, payload in self.sent:
-            if kind == "image":
-                out.append(payload)
-            elif kind == "chain":
-                out.extend(
-                    getattr(comp, "file", "")
-                    for comp in payload
-                    if getattr(comp, "file", "")
-                )
-        return out
+        return [
+            comp.file
+            for chain in self.sent
+            for comp in chain
+            if getattr(comp, "file", None)
+        ]
 
 
 def _stub_waiter(reply: str | None, sender: str = "u1"):
@@ -488,7 +523,8 @@ class TestReferenceImages:
         class FakeImage:
             configured = True
 
-        await card_mod.build_closeup(FakeImage(), self._source(), "提示词")
+        prompt = Prompt(index=1, name="甲", text="提示词")
+        await card_mod.build_closeup(FakeImage(), self._source(), prompt)
         assert seen.get("with_card_ref") is False
 
 
@@ -546,8 +582,8 @@ class TestAskChoice:
             def decorator(func):
                 async def wrapper(event):
                     reply = _FakeEvent(msg="abc")
-                    reply.send = lambda r: replies.append(r[1]) or _noop()
                     await func(types.SimpleNamespace(stop=lambda: None), reply)
+                    replies.extend(reply.texts)
 
                 return wrapper
 
@@ -571,8 +607,8 @@ class TestAskChoice:
             def decorator(func):
                 async def wrapper(event):
                     reply = _FakeEvent(msg="9")
-                    reply.send = lambda r: replies.append(r[1]) or _noop()
                     await func(types.SimpleNamespace(stop=lambda: None), reply)
+                    replies.extend(reply.texts)
 
                 return wrapper
 
@@ -603,7 +639,11 @@ class TestConfigSchema:
         item = self._schema()["mingpian_prompts"]
         assert item["type"] == "template_list"
         assert item["templates"]["prompt_item"]["display_item"] == "name"
-        assert set(item["templates"]["prompt_item"]["items"]) == {"name", "prompt"}
+        assert set(item["templates"]["prompt_item"]["items"]) == {
+            "name",
+            "prompt",
+            "size",
+        }
 
     def test_默认提示词可被解析(self):
         defaults = self._schema()["mingpian_prompts"]["default"]
@@ -635,27 +675,25 @@ class TestCloseupCommand:
         return plugin_main.JX3MingpianPlugin(context=None, config=base)
 
     async def test_缺参数给用法(self):
-        event = _FakeEvent()
-        await self._plugin().mingpian_closeup(event, "", "")
+        event = _FakeEvent(msg="名片特写")
+        await self._plugin().mingpian_closeup(event)
         assert event.texts and "用法" in event.texts[0]
 
     async def test_非法名片序号被拦下(self):
-        event = _FakeEvent()
-        await self._plugin().mingpian_closeup(event, "飞龙在天", "小螺卜头", "abc")
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头 abc")
+        await self._plugin().mingpian_closeup(event)
         assert len(event.texts) == 1 and "序号" in event.texts[0]
 
     async def test_未配置提示词(self):
-        event = _FakeEvent()
-        await self._plugin(mingpian_prompts=[]).mingpian_closeup(
-            event, "飞龙在天", "小螺卜头"
-        )
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头")
+        await self._plugin(mingpian_prompts=[]).mingpian_closeup(event)
         assert event.texts == ["未配置提示词"]
 
     async def test_超过并发上限给提示(self):
         plugin = self._plugin(image_api_max_concurrent=2)
         plugin._active = 2
-        event = _FakeEvent()
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头")
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
         assert len(event.texts) == 1 and "同时最多 2 个" in event.texts[0]
 
     async def test_回复序号后出图(self, monkeypatch):
@@ -677,23 +715,22 @@ class TestCloseupCommand:
                 note="飞龙在天 · 小螺卜头 · 第 1/4 张",
             )
 
-        async def fake_closeup(image, source, prompt_text):
-            seen["prompt"] = prompt_text
+        async def fake_closeup(image, source, prompt):
+            seen["prompt"] = prompt
             return b"\x89PNG-fake"
 
         monkeypatch.setattr(plugin_main, "ask_choice", fake_ask)
         monkeypatch.setattr(plugin_main, "resolve_card", fake_resolve)
         monkeypatch.setattr(plugin_main, "build_closeup", fake_closeup)
 
-        event = _FakeEvent()
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头", "1")
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头 1")
+        await plugin.mingpian_closeup(event)
 
         assert seen["count"] == 2 and seen["timeout"] == plugin_main.CHOICE_TIMEOUT
         assert "1. 甲" in seen["menu"] and "2. 乙" in seen["menu"]
         assert seen["index"] == 1
-        assert seen["prompt"] == "提示词乙"
-        assert event.texts[0] == DEFAULT_TASK_HINT
-        assert "乙" in event.texts[1]
+        assert seen["prompt"].name == "乙"
+        assert event.texts == [DEFAULT_TASK_HINT]
         assert event.images and event.images[0].startswith("base64://")
         assert plugin._active == 0
 
@@ -709,8 +746,8 @@ class TestCloseupCommand:
         monkeypatch.setattr(plugin_main, "ask_choice", fake_ask)
         monkeypatch.setattr(plugin_main, "resolve_card", boom)
 
-        event = _FakeEvent()
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头")
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
         assert event.texts[0] == DEFAULT_TASK_HINT
         assert "名片特写生成失败" in event.texts[1]
         assert not event.images
@@ -727,16 +764,41 @@ class TestCloseupCommand:
                 school="", scene="", accent="#000000", note="n"
             )
 
-        async def fake_closeup(image, source, prompt_text):
+        async def fake_closeup(image, source, prompt):
             return b"x"
 
         monkeypatch.setattr(plugin_main, "ask_choice", fake_ask)
         monkeypatch.setattr(plugin_main, "resolve_card", fake_resolve)
         monkeypatch.setattr(plugin_main, "build_closeup", fake_closeup)
 
-        event = _FakeEvent()
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头")
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
         assert event.texts[0] == "排队中，请稍候"
+
+    async def test_不再单独发结果说明(self, monkeypatch):
+        plugin = self._plugin()
+
+        async def fake_ask(event, text, count, run, *, timeout=0):
+            await run(1, event)
+
+        async def fake_resolve(jx3, *, server, name, index=None):
+            return types.SimpleNamespace(
+                school="唐门",
+                scene="蜀中",
+                accent="#123456",
+                note="飞龙在天 · 小螺卜头 · 第 1/4 张",
+            )
+
+        async def fake_closeup(image, source, prompt):
+            return b"png"
+
+        monkeypatch.setattr(plugin_main, "ask_choice", fake_ask)
+        monkeypatch.setattr(plugin_main, "resolve_card", fake_resolve)
+        monkeypatch.setattr(plugin_main, "build_closeup", fake_closeup)
+
+        event = _FakeEvent(msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
+        assert all("第 1/4 张" not in text for text in event.texts)
 
 
 class TestKeyPool:
@@ -985,15 +1047,12 @@ class TestWhitelistCommand:
         base.update(conf)
         return plugin_main.JX3MingpianPlugin(context=None, config=base)
 
-    @pytest.mark.asyncio
     async def test_名片卡_名单外被拒(self):
         plugin = self._plugin(whitelist_enabled=True, whitelist=["u1"])
-        out = await _collect(
-            plugin.mingpian_card(_FakeEvent(sender="u9"), "飞龙在天", "小螺卜头")
-        )
-        assert len(out) == 1 and out[0][1] == DENIED_MESSAGE
+        event = _FakeEvent(sender="u9", msg="名片卡 飞龙在天 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert event.texts == [DENIED_MESSAGE]
 
-    @pytest.mark.asyncio
     async def test_名片卡_名单内放行(self, monkeypatch):
         plugin = self._plugin(whitelist_enabled=True, whitelist=["u1"])
 
@@ -1001,15 +1060,19 @@ class TestWhitelistCommand:
             return {"bgImage": "data:image/png;base64,AA=="}, "说明"
 
         monkeypatch.setattr(plugin_main, "build_card", fake_build)
-        out = await _collect(
-            plugin.mingpian_card(_FakeEvent(sender="u1"), "飞龙在天", "小螺卜头")
+        monkeypatch.setattr(
+            plugin_main.JX3MingpianPlugin,
+            "_render",
+            lambda self, payload: _async_value("http://img/card.png"),
         )
-        assert out[0][1] == DEFAULT_TASK_HINT
+        event = _FakeEvent(sender="u1", msg="名片卡 飞龙在天 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert event.texts == [DEFAULT_TASK_HINT]
 
     async def test_名片特写_名单外被拒(self):
         plugin = self._plugin(whitelist_enabled=True, whitelist=["u1"])
-        event = _FakeEvent(sender="u9")
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头")
+        event = _FakeEvent(sender="u9", msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
         assert event.texts == [DENIED_MESSAGE]
 
     async def test_名片特写_名单内放行(self, monkeypatch):
@@ -1023,15 +1086,15 @@ class TestWhitelistCommand:
                 school="", scene="", accent="#000000", note="n"
             )
 
-        async def fake_closeup(image, source, prompt_text):
+        async def fake_closeup(image, source, prompt):
             return b"x"
 
         monkeypatch.setattr(plugin_main, "ask_choice", fake_ask)
         monkeypatch.setattr(plugin_main, "resolve_card", fake_resolve)
         monkeypatch.setattr(plugin_main, "build_closeup", fake_closeup)
 
-        event = _FakeEvent(sender="u1")
-        await plugin.mingpian_closeup(event, "飞龙在天", "小螺卜头")
+        event = _FakeEvent(sender="u1", msg="名片特写 飞龙在天 小螺卜头")
+        await plugin.mingpian_closeup(event)
         assert event.texts[0] == DEFAULT_TASK_HINT
 
 
@@ -1048,30 +1111,26 @@ class TestCardCommand:
         base.update(conf)
         return plugin_main.JX3MingpianPlugin(context=None, config=base)
 
-    @pytest.mark.asyncio
     async def test_缺参数给用法(self):
         plugin = self._plugin()
-        out = await _collect(plugin.mingpian_card(_FakeEvent(), "", ""))
-        assert out and out[0][0] == "text"
-        assert "用法" in out[0][1]
+        event = _FakeEvent(msg="名片卡")
+        await plugin.mingpian_card(event)
+        assert event.texts and "用法" in event.texts[0]
 
-    @pytest.mark.asyncio
     async def test_非法序号被拦下(self):
         plugin = self._plugin()
-        out = await _collect(
-            plugin.mingpian_card(_FakeEvent(), "飞龙在天", "小螺卜头", "abc")
-        )
-        assert len(out) == 1 and "序号" in out[0][1]
+        event = _FakeEvent(msg="名片卡 飞龙在天 小螺卜头 abc")
+        await plugin.mingpian_card(event)
+        assert len(event.texts) == 1 and "序号" in event.texts[0]
 
-    @pytest.mark.asyncio
     async def test_超过并发上限给提示(self):
         plugin = self._plugin(image_api_max_concurrent=2)
         plugin._active = 2
-        out = await _collect(plugin.mingpian_card(_FakeEvent(), "飞龙在天", "小螺卜头"))
-        assert len(out) == 1
-        assert "同时最多 2 张" in out[0][1]
+        event = _FakeEvent(msg="名片卡 飞龙在天 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert len(event.texts) == 1
+        assert "同时最多 2 张" in event.texts[0]
 
-    @pytest.mark.asyncio
     async def test_先回执再出图(self, monkeypatch):
         plugin = self._plugin()
         calls = {}
@@ -1087,17 +1146,15 @@ class TestCardCommand:
             plugin_main.JX3MingpianPlugin,
             "_render",
             lambda self, payload: _async_value("http://img/card.png"),
-            raising=False,
         )
 
-        out = await _collect(
-            plugin.mingpian_card(_FakeEvent(), "飞龙在天", "小螺卜头", "1")
-        )
-        assert out[0][1] == DEFAULT_TASK_HINT
+        event = _FakeEvent(msg="名片卡 飞龙在天 小螺卜头 1")
+        await plugin.mingpian_card(event)
+        assert event.texts[0] == DEFAULT_TASK_HINT
         assert calls == {"server": "飞龙在天", "name": "小螺卜头", "index": 1}
+        assert event.images == ["http://img/card.png"]
         assert plugin._active == 0, "跑完要把并发计数放回去"
 
-    @pytest.mark.asyncio
     async def test_生图失败给失败提示(self, monkeypatch):
         plugin = self._plugin()
 
@@ -1105,16 +1162,123 @@ class TestCardCommand:
             raise ImageAPIError("生图密钥被拒绝（HTTP 401）：bad key")
 
         monkeypatch.setattr(plugin_main, "build_card", boom)
-        out = await _collect(plugin.mingpian_card(_FakeEvent(), "飞龙在天", "小螺卜头"))
-        assert out[0][1] == DEFAULT_TASK_HINT
-        assert "名片卡生成失败" in out[1][1]
+        event = _FakeEvent(msg="名片卡 飞龙在天 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert event.texts[0] == DEFAULT_TASK_HINT
+        assert "名片卡生成失败" in event.texts[1]
         assert plugin._active == 0
 
-    @pytest.mark.asyncio
     async def test_没配生图接口直接报错(self):
         plugin = self._plugin(image_api_base_url="", image_api_key="")
-        out = await _collect(plugin.mingpian_card(_FakeEvent(), "飞龙在天", "小螺卜头"))
-        assert "还没配置生图接口" in out[1][1]
+        event = _FakeEvent(msg="名片卡 飞龙在天 小螺卜头")
+        await plugin.mingpian_card(event)
+        assert "还没配置生图接口" in event.texts[1]
+
+
+class TestCardArgs:
+    @pytest.mark.parametrize(
+        "args, bound, expected",
+        [
+            (["飞龙在天", "小螺卜头"], "", ("飞龙在天", "小螺卜头", "")),
+            (["飞龙在天", "小螺卜头", "2"], "", ("飞龙在天", "小螺卜头", "2")),
+            (["小螺卜头"], "飞龙在天", ("飞龙在天", "小螺卜头", "")),
+            (["小螺卜头", "3"], "飞龙在天", ("飞龙在天", "小螺卜头", "3")),
+            (["小螺卜头", "3"], "", ("小螺卜头", "3", "")),
+        ],
+    )
+    def test_解析(self, args, bound, expected):
+        assert parse_card_args(args, bound) == expected
+
+    @pytest.mark.parametrize("args", [[], ["a", "b", "c", "d"]])
+    def test_报错(self, args):
+        assert isinstance(parse_card_args(args, ""), str)
+
+    def test_未绑定且只给角色名时提示绑定(self):
+        assert "绑定" in parse_card_args(["小螺卜头"], "")
+
+
+class TestBindingStore:
+    def test_存取与落盘(self, tmp_path):
+        path = tmp_path / "b.json"
+        store = BindingStore(path)
+        assert store.get("umo1") == ""
+        store.set("umo1", "飞龙在天")
+        assert store.get("umo1") == "飞龙在天"
+        assert BindingStore(path).get("umo1") == "飞龙在天"
+
+    def test_忽略空值(self, tmp_path):
+        store = BindingStore(tmp_path / "b.json")
+        store.set("", "飞龙在天")
+        store.set("umo1", "   ")
+        assert store.get("umo1") == ""
+
+    def test_文件损坏不炸(self, tmp_path):
+        path = tmp_path / "b.json"
+        path.write_text("{不是 json", encoding="utf-8")
+        assert BindingStore(path).get("umo1") == ""
+
+
+class TestCommandPattern:
+    @pytest.mark.parametrize(
+        "text",
+        ["名片卡", "/名片卡", "名片卡 飞龙在天", "/名片卡 飞龙在天"],
+    )
+    def test_斜杠可选(self, text):
+        assert re.match(plugin_main._command_pattern("名片卡"), text)
+
+    @pytest.mark.parametrize("text", ["名片卡牌", "名片", "x名片卡"])
+    def test_不误匹配(self, text):
+        assert not re.match(plugin_main._command_pattern("名片卡"), text)
+
+
+class TestSizePassthrough:
+    async def test_尺寸与响应格式都传给接口(self, monkeypatch):
+        client = ImageAPIClient("https://hub.example.com", "k")
+        seen = {}
+        original = FormData.add_field
+
+        def spy(self, name, value, **kwargs):
+            seen[name] = value
+            return original(self, name, value, **kwargs)
+
+        monkeypatch.setattr(FormData, "add_field", spy)
+
+        async def fake_post(self, url, key, *, form):
+            return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        await client.edit("提示词", [REF_IMAGE], size="2048x880")
+        assert seen["size"] == "2048x880"
+        assert seen["response_format"] == "b64_json"
+
+
+class TestDirectSend:
+    """回复直发消息链，不经结果装饰，因此不带引用与 @。"""
+
+    def test_命令用直发(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8")
+        assert "MessageChain(chain=" in source
+        assert "event.plain_result(" not in source
+
+    def test_菜单也用直发(self):
+        source = (ROOT / "core" / "menu.py").read_text(encoding="utf-8")
+        assert "MessageChain(chain=" in source
+        assert "plain_result" not in source
+
+
+class TestPromptSize:
+    def test_条目带尺寸(self):
+        prompts = load_prompts([{"name": "甲", "prompt": "x", "size": "1024x1024"}])
+        assert prompts[0].size == "1024x1024"
+
+    def test_缺尺寸用默认(self):
+        prompts = load_prompts([{"name": "甲", "prompt": "x"}])
+        assert prompts[0].size == DEFAULT_POSTER_SIZE
+
+    def test_默认提示词都带尺寸(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        for entry in schema["mingpian_prompts"]["default"]:
+            assert entry.get("size"), entry["name"]
 
 
 async def _async_value(value):

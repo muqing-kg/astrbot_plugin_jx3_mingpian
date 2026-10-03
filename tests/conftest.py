@@ -31,8 +31,19 @@ def _install_fake_astrbot() -> None:
         def fromBase64(data):
             return _Image(f"base64://{data}")
 
+    class _Plain:
+        def __init__(self, text=""):
+            self.text = text
+
     components.Image = _Image
-    components.Plain = lambda text: text
+    components.Plain = _Plain
+    components.Reply = object
+
+    class _MessageChain:
+        def __init__(self, chain=None):
+            self.chain = chain or []
+
+    event.MessageChain = _MessageChain
 
     # session_waiter 装饰器在测试里原样返回函数，不启动真实等待
     session_waiter.SessionController = object
@@ -52,7 +63,7 @@ def _install_fake_astrbot() -> None:
         return decorator
 
     event.AstrMessageEvent = object
-    event.filter = types.SimpleNamespace(command=_command)
+    event.filter = types.SimpleNamespace(command=_command, regex=_command)
 
     class Star:
         def __init__(self, context=None):
@@ -64,9 +75,15 @@ def _install_fake_astrbot() -> None:
 
         return decorator
 
+    # 绑定数据写到临时目录，不污染插件目录
+    import tempfile
+
+    _data_dir = Path(tempfile.mkdtemp(prefix="mingpian-test-"))
+
     star.Context = object
     star.Star = Star
     star.register = register
+    star.StarTools = types.SimpleNamespace(get_data_dir=lambda name: _data_dir)
 
     core.utils = core_utils
     core_utils.session_waiter = session_waiter

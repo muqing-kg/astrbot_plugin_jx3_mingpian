@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .core.access import DENIED_MESSAGE, is_allowed, load_whitelist
+from .core.binding import FILENAME as BINDING_FILE
+from .core.binding import BindingStore, parse_card_args
 from .core.card import build_card, build_closeup, resolve_card
 from .core.image_api import ImageAPIClient, ImageAPIError, normalize_api_base
 from .core.jx3api import JX3APIClient, JX3APIError
@@ -41,6 +44,7 @@ PLUGIN_NAME = "astrbot_plugin_jx3_mingpian"
 PLUGIN_VERSION = "1.0.0"
 COMMAND = "名片卡"
 CLOSEUP_COMMAND = "名片特写"
+BIND_COMMAND = "绑定"
 DEFAULT_CONCURRENT = 3
 TEMPLATE_PATH = (
     Path(__file__).resolve().parent / "templates" / "standalone" / "mingpian.html"
@@ -66,6 +70,7 @@ def usage() -> str:
         f"用法：\n"
         f"  {COMMAND} 服务器 角色名       随机抽一张名片形象图\n"
         f"  {COMMAND} 服务器 角色名 序号   指定第几张（序号从 1 起）\n"
+        f"  {COMMAND} 角色名              已绑定区服时可省略服务器\n"
         f"例如：{COMMAND} 飞龙在天 小螺卜头 1"
     )
 
@@ -75,9 +80,31 @@ def closeup_usage() -> str:
         f"用法：\n"
         f"  {CLOSEUP_COMMAND} 服务器 角色名       随机抽一张名片形象图\n"
         f"  {CLOSEUP_COMMAND} 服务器 角色名 序号   指定第几张（序号从 1 起）\n"
+        f"  {CLOSEUP_COMMAND} 角色名              已绑定区服时可省略服务器\n"
         f"例如：{CLOSEUP_COMMAND} 飞龙在天 小螺卜头\n"
         f"执行后返回提示词清单，回复序号即可生成。"
     )
+
+
+def _data_dir() -> Path:
+    """插件数据目录。取不到 AstrBot 数据目录时退回插件目录下的 data。"""
+    try:
+        return Path(StarTools.get_data_dir(PLUGIN_NAME))
+    except (AttributeError, ImportError, OSError, TypeError):
+        path = Path(__file__).resolve().parent / "data"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+def _command_pattern(name: str) -> str:
+    """命令匹配式。斜杠可选，命令后需为空白或结尾。"""
+    return rf"^/?{re.escape(name)}(?:\s|$)"
+
+
+def _split_args(event: AstrMessageEvent) -> list[str]:
+    """取命令名之后的参数。"""
+    text = (event.message_str or "").strip().removeprefix("/")
+    return text.split()[1:]
 
 
 @register(
@@ -96,6 +123,7 @@ class JX3MingpianPlugin(Star):
         # 密钥池在请求之间共享，轮询位置才不会被重置
         self._token_pool = KeyPool(self._list("jx3api_token"))
         self._image_key_pool = KeyPool(self._list("image_api_key"))
+        self.bindings = BindingStore(_data_dir() / BINDING_FILE)
         logger.info("%s 初始化完成（同时生成上限 %d）", PLUGIN_NAME, self._limit())
 
     # ---------- 配置 ----------
@@ -164,50 +192,87 @@ class JX3MingpianPlugin(Star):
             getattr(event, "unified_msg_origin", ""),
         )
 
+    # ---------- 发送 ----------
+
+    async def _send(self, event: AstrMessageEvent, *comps) -> None:
+        """直发消息链。不经 AstrBot 结果装饰，避免附加引用与 @。"""
+        try:
+            await event.send(MessageChain(chain=list(comps)))
+        except Exception:
+            logger.exception("消息发送失败")
+        try:
+            event.stop_event()
+        except AttributeError:
+            logger.debug("事件不支持 stop_event，跳过")
+
+    async def _send_text(self, event: AstrMessageEvent, text: str) -> None:
+        await self._send(event, Comp.Plain(text))
+
+    async def _send_result(self, event: AstrMessageEvent, result) -> None:
+        """发送由 event.image_result 构造的结果，保留其自带的路径处理。"""
+        await self._send(event, *(getattr(result, "chain", None) or []))
+
+    def _bound_server(self, event: AstrMessageEvent) -> str:
+        return self.bindings.get(getattr(event, "unified_msg_origin", ""))
+
     # ---------- 命令 ----------
 
-    @filter.command(COMMAND)
-    async def mingpian_card(
-        self,
-        event: AstrMessageEvent,
-        server: str = "",
-        name: str = "",
-        index: str = "",
-    ):
-        """名片卡 服务器 角色名 [序号]"""
+    @filter.regex(_command_pattern(BIND_COMMAND))
+    async def bind_server(self, event: AstrMessageEvent):
+        """绑定 区服名"""
         if not self._allowed(event):
-            yield event.plain_result(DENIED_MESSAGE)
+            await self._send_text(event, DENIED_MESSAGE)
+            return
+        args = _split_args(event)
+        if not args:
+            current = self._bound_server(event)
+            await self._send_text(
+                event,
+                f"当前会话已绑定区服：{current}" if current else "用法：绑定 区服名",
+            )
+            return
+        server = " ".join(args).strip()
+        self.bindings.set(getattr(event, "unified_msg_origin", ""), server)
+        await self._send_text(event, f"已为当前会话绑定区服：{server}")
+
+    @filter.regex(_command_pattern(COMMAND))
+    async def mingpian_card(self, event: AstrMessageEvent):
+        """名片卡 [服务器] 角色名 [序号]"""
+        if not self._allowed(event):
+            await self._send_text(event, DENIED_MESSAGE)
             return
 
-        server, name, index = server.strip(), name.strip(), index.strip()
-        if not server or not name:
-            yield event.plain_result(usage())
+        parsed = parse_card_args(_split_args(event), self._bound_server(event))
+        if isinstance(parsed, str):
+            await self._send_text(event, f"{parsed}\n\n{usage()}")
             return
+        server, name, index = parsed
 
         picked: int | None = None
         if index:
             try:
                 picked = parse_card_index(index)
             except ValueError:
-                yield event.plain_result(
-                    "序号只能是正整数，例如：名片卡 飞龙在天 小螺卜头 1"
+                await self._send_text(
+                    event, "序号只能是正整数，例如：名片卡 飞龙在天 小螺卜头 1"
                 )
                 return
 
         limit = self._limit()
         if self._active >= limit:
-            yield event.plain_result(
+            await self._send_text(
+                event,
                 f"现在已有 {self._active} 张名片卡在生成中（同时最多 {limit} 张），"
-                "请过几分钟再试。"
+                "请过几分钟再试。",
             )
             return
 
         # 生图耗时较长，先回执再执行
-        yield event.plain_result(task_hint(self.conf.get("mingpian_task_hint")))
+        await self._send_text(event, task_hint(self.conf.get("mingpian_task_hint")))
 
         self._active += 1
         try:
-            payload, note = await build_card(
+            payload, _note = await build_card(
                 self._jx3_client(),
                 self._image_client(),
                 server=server,
@@ -215,11 +280,11 @@ class JX3MingpianPlugin(Star):
                 index=picked,
             )
         except (JX3APIError, ImageAPIError) as exc:
-            yield event.plain_result(f"名片卡生成失败：{exc}")
+            await self._send_text(event, f"名片卡生成失败：{exc}")
             return
         except Exception as exc:
             logger.exception("名片卡生成异常")
-            yield event.plain_result(f"名片卡生成失败：{exc}")
+            await self._send_text(event, f"名片卡生成失败：{exc}")
             return
         finally:
             self._active -= 1
@@ -228,64 +293,49 @@ class JX3MingpianPlugin(Star):
             url = await self._render(payload)
         except Exception as exc:
             logger.exception("名片卡渲染失败")
-            yield event.plain_result(f"渲染图片失败：{exc}")
+            await self._send_text(event, f"渲染图片失败：{exc}")
             return
 
-        yield event.plain_result(note)
-        yield event.image_result(url)
+        await self._send_result(event, event.image_result(url))
 
-    @filter.command(CLOSEUP_COMMAND)
-    async def mingpian_closeup(
-        self,
-        event: AstrMessageEvent,
-        server: str = "",
-        name: str = "",
-        index: str = "",
-    ):
-        """名片特写 服务器 角色名 [名片序号]"""
-        await self._mingpian_closeup(event, server, name, index)
+    @filter.regex(_command_pattern(CLOSEUP_COMMAND))
+    async def mingpian_closeup(self, event: AstrMessageEvent):
+        """名片特写 [服务器] 角色名 [名片序号]"""
+        await self._mingpian_closeup(event)
 
-    async def _mingpian_closeup(
-        self,
-        event: AstrMessageEvent,
-        server: str,
-        name: str,
-        index: str,
-    ):
+    async def _mingpian_closeup(self, event: AstrMessageEvent):
         """名片特写：先定名片，再选提示词，最后生成图片。"""
         if not self._allowed(event):
-            await event.send(event.plain_result(DENIED_MESSAGE))
+            await self._send_text(event, DENIED_MESSAGE)
             return
 
-        server, name, index = server.strip(), name.strip(), index.strip()
-        if not server or not name:
-            await event.send(event.plain_result(closeup_usage()))
+        parsed = parse_card_args(_split_args(event), self._bound_server(event))
+        if isinstance(parsed, str):
+            await self._send_text(event, f"{parsed}\n\n{closeup_usage()}")
             return
+        server, name, index = parsed
 
         picked: int | None = None
         if index:
             try:
                 picked = parse_card_index(index)
             except ValueError:
-                await event.send(
-                    event.plain_result(
-                        "序号只能是正整数，例如：名片特写 飞龙在天 小螺卜头 1"
-                    )
+                await self._send_text(
+                    event, "序号只能是正整数，例如：名片特写 飞龙在天 小螺卜头 1"
                 )
                 return
 
         prompts = load_prompts(self.conf.get("mingpian_prompts"))
         if not prompts:
-            await event.send(event.plain_result("未配置提示词"))
+            await self._send_text(event, "未配置提示词")
             return
 
         limit = self._limit()
         if self._active >= limit:
-            await event.send(
-                event.plain_result(
-                    f"现在已有 {self._active} 个任务在生成中（同时最多 {limit} 个），"
-                    "请过几分钟再试。"
-                )
+            await self._send_text(
+                event,
+                f"现在已有 {self._active} 个任务在生成中（同时最多 {limit} 个），"
+                "请过几分钟再试。",
             )
             return
 
@@ -308,39 +358,34 @@ class JX3MingpianPlugin(Star):
         # 菜单等待期间名额可能已被占满，此处再确认一次
         limit = self._limit()
         if self._active >= limit:
-            await event.send(
-                event.plain_result(
-                    f"现在已有 {self._active} 个任务在生成中（同时最多 {limit} 个），"
-                    "请过几分钟再试。"
-                )
+            await self._send_text(
+                event,
+                f"现在已有 {self._active} 个任务在生成中（同时最多 {limit} 个），"
+                "请过几分钟再试。",
             )
             return
 
-        await event.send(
-            event.plain_result(task_hint(self.conf.get("mingpian_task_hint")))
-        )
+        await self._send_text(event, task_hint(self.conf.get("mingpian_task_hint")))
 
         self._active += 1
         try:
             source = await resolve_card(
                 self._jx3_client(), server=server, name=name, index=index
             )
-            image_bytes = await build_closeup(self._image_client(), source, prompt.text)
+            image_bytes = await build_closeup(self._image_client(), source, prompt)
         except (JX3APIError, ImageAPIError) as exc:
-            await event.send(event.plain_result(f"名片特写生成失败：{exc}"))
+            await self._send_text(event, f"名片特写生成失败：{exc}")
             return
         except Exception as exc:
             logger.exception("名片特写生成异常")
-            await event.send(event.plain_result(f"名片特写生成失败：{exc}"))
+            await self._send_text(event, f"名片特写生成失败：{exc}")
             return
         finally:
             self._active -= 1
 
-        await event.send(event.plain_result(f"{prompt.name} · {source.note}"))
-        await event.send(
-            event.chain_result(
-                [Comp.Image.fromBase64(base64.b64encode(image_bytes).decode("ascii"))]
-            )
+        await self._send(
+            event,
+            Comp.Image.fromBase64(base64.b64encode(image_bytes).decode("ascii")),
         )
 
     async def terminate(self):

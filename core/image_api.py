@@ -32,16 +32,10 @@ DEFAULT_MODEL = "gpt-image-2.5"
 
 DEFAULT_TIMEOUT = 300
 
-VALID_SIZES = {
-    "auto",
-    "1024x1024",
-    "1536x1024",
-    "1024x1536",
-    "2048x2048",
-    "2048x1152",
-    "3840x2160",
-    "2160x3840",
-}
+# 名片卡底卡用的尺寸；生图接口接受的尺寸集合各家不同，这里只给默认值
+DEFAULT_CARD_SIZE = "2048x1152"
+# 21:9 横幅，名片特写的默认尺寸
+DEFAULT_POSTER_SIZE = "2048x880"
 
 
 class ImageAPIError(RuntimeError):
@@ -142,23 +136,66 @@ class ImageAPIClient:
             return f"生图接口限流或额度不足（HTTP 429）：{detail}"
         return f"生图接口报错（HTTP {status}）：{detail}"
 
-    @staticmethod
-    def _pick_image(payload: dict) -> bytes:
+    async def _extract_image(self, payload: dict) -> bytes:
+        """从响应中取出图片。
+
+        兼容三种返回形式：b64_json（含 data URI）、url、image_url。
+        服务端默认返回 url，因此请求时一并要求 b64_json。
+        """
         items = payload.get("data")
         if not isinstance(items, list) or not items:
             raise ImageAPIError("生图接口没有返回图片")
         for item in items:
             if not isinstance(item, dict):
                 continue
-            b64 = item.get("b64_json")
-            if not isinstance(b64, str) or not b64:
-                continue
-            try:
-                return base64.b64decode(b64, validate=True)
-            except (binascii.Error, ValueError):
-                logger.warning("生图返回的 b64_json 无法解码，尝试下一条")
-                continue
-        raise ImageAPIError("生图接口没有返回可用的图片数据（缺 b64_json）")
+            for field in ("b64_json", "b64", "image_base64"):
+                value = item.get(field)
+                if isinstance(value, str) and value:
+                    data = self._decode_b64(value)
+                    if data is not None:
+                        return data
+            for field in ("url", "image_url"):
+                value = item.get(field)
+                if isinstance(value, str) and value:
+                    data = await self._fetch_image(value)
+                    if data is not None:
+                        return data
+        raise ImageAPIError("生图接口没有返回可用的图片数据")
+
+    @staticmethod
+    def _decode_b64(value: str) -> bytes | None:
+        """解码 base64，兼容 data:image/png;base64,xxx 前缀。"""
+        text = (
+            value.split(",", 1)[1]
+            if value.startswith("data:") and "," in value
+            else value
+        )
+        try:
+            return base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError):
+            logger.warning("生图返回的 base64 数据无法解码，尝试下一条")
+            return None
+
+    async def _fetch_image(self, url: str) -> bytes | None:
+        """下载图片地址。data URI 直接解码。"""
+        if url.startswith("data:"):
+            return self._decode_b64(url)
+        if not url.startswith(("http://", "https://")):
+            return None
+        timeout = ClientTimeout(total=self.timeout)
+        try:
+            # 图片地址由生图服务返回，与 JX3API 的代理配置无关
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.get(url) as response,
+            ):
+                if response.status != 200:
+                    logger.warning("图片下载失败 %s: %s", response.status, url)
+                    return None
+                return await response.read()
+        except aiohttp.ClientError as exc:
+            logger.warning("图片下载出错 %s: %s", url, exc)
+            return None
 
     @staticmethod
     def _is_stable_failure(message: str) -> bool:
@@ -173,7 +210,7 @@ class ImageAPIClient:
         prompt: str,
         images: Iterable[Path],
         *,
-        size: str = "2048x1152",
+        size: str = DEFAULT_CARD_SIZE,
         quality: str = "high",
         retries: int = 1,
     ) -> bytes:
@@ -194,9 +231,12 @@ class ImageAPIClient:
                 form = FormData()
                 form.add_field("model", self.model)
                 form.add_field("prompt", prompt)
-                form.add_field("size", size if size in VALID_SIZES else "auto")
+                # 尺寸原样透传：各家服务接受的尺寸集合不同，不做本地白名单过滤
+                form.add_field("size", size or "auto")
                 form.add_field("quality", quality)
                 form.add_field("n", "1")
+                # 默认返回的是图片地址，这里直接要 base64
+                form.add_field("response_format", "b64_json")
                 for path in paths:
                     form.add_field(
                         "image[]",
@@ -219,7 +259,7 @@ class ImageAPIClient:
                 try:
                     payload = await self._post(self.endpoint("edits"), key, form=form)
                     self.keys.mark_used(key)
-                    return self._pick_image(payload)
+                    return await self._extract_image(payload)
                 except ImageAPIError as exc:
                     last_error = str(exc)
                     if self._is_stable_failure(last_error):

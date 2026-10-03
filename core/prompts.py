@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .image_api import DEFAULT_POSTER_SIZE
+
 DEFAULT_TASK_HINT = "正在努力生成图片中，请耐心等待几分钟..."
 DEFAULT_PROMPT_NAME = "提示词"
 MENU_TITLE = "名片特写"
@@ -17,6 +19,7 @@ class Prompt:
     index: int
     name: str
     text: str
+    size: str = DEFAULT_POSTER_SIZE
 
 
 def load_prompts(raw: object) -> list[Prompt]:
@@ -36,7 +39,8 @@ def load_prompts(raw: object) -> list[Prompt]:
             str(item.get("name") or "").strip()
             or f"{DEFAULT_PROMPT_NAME}{len(prompts) + 1}"
         )
-        prompts.append(Prompt(index=len(prompts) + 1, name=name, text=text))
+        size = str(item.get("size") or "").strip() or DEFAULT_POSTER_SIZE
+        prompts.append(Prompt(index=len(prompts) + 1, name=name, text=text, size=size))
     return prompts
 
 
