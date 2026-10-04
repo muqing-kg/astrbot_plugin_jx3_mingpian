@@ -9,16 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import Iterable
 from typing import Any
 
 import aiohttp
 from aiohttp import ClientTimeout
+from astrbot.api import logger
 
 from .keypool import KeyPool
-
-logger = logging.getLogger("astrbot")
 
 DEFAULT_BASE_URL = "https://www.jx3api.com"
 DEFAULT_TIMEOUT = 30

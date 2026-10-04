@@ -17,16 +17,14 @@ import asyncio
 import base64
 import binascii
 import json
-import logging
 from collections.abc import Iterable
 from pathlib import Path
 
 import aiohttp
 from aiohttp import ClientTimeout, FormData
+from astrbot.api import logger
 
 from .keypool import KeyPool
-
-logger = logging.getLogger("astrbot")
 
 DEFAULT_MODEL = "gpt-image-2.5"
 

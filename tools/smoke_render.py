@@ -11,10 +11,22 @@ from __future__ import annotations
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# core 模块从 astrbot.api 取 logger，本工具在 AstrBot 之外运行，补一个占位模块
+if "astrbot" not in sys.modules:
+    import logging
+
+    _astrbot = types.ModuleType("astrbot")
+    _api = types.ModuleType("astrbot.api")
+    _api.logger = logging.getLogger("smoke-render")
+    _astrbot.api = _api
+    sys.modules["astrbot"] = _astrbot
+    sys.modules["astrbot.api"] = _api
 
 from core.card import build_payload
 

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 FILENAME = "bindings.json"
 UNBOUND_HINT = (

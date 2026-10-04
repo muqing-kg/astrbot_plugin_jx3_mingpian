@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
-
-logger = logging.getLogger("astrbot")
 
 CHOICE_TIMEOUT = 15
 
@@ -66,7 +64,7 @@ async def ask_choice(
         resolved = True
         try:
             await run(choice, new_event)
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("选择后执行失败")
         controller.stop()
 
@@ -77,11 +75,11 @@ async def ask_choice(
             return
         try:
             await run(1, event)
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("默认选项执行失败")
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.exception("选择等待异常")
         try:
             await fail(event, "选择等待异常，请重新发送命令")
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("异常提示发送失败")

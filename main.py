@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import base64
-import logging
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -25,7 +24,7 @@ from typing import Any
 from urllib.request import url2pathname
 
 import astrbot.api.message_components as Comp
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
@@ -54,10 +53,8 @@ from .core.prompts import Prompt, load_prompts, menu_text, task_hint
 from .core.servers import canonical_server, server_list_text
 from .core.sizes import card_size
 
-logger = logging.getLogger("astrbot")
-
 PLUGIN_NAME = "astrbot_plugin_jx3_mingpian"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 COMMAND = "名片卡"
 CLOSEUP_COMMAND = "名片特写"
 BIND_COMMAND = "名片绑定"
@@ -267,7 +264,7 @@ class JX3MingpianPlugin(Star):
         """直发消息链。不经 AstrBot 结果装饰，避免附加引用与 @。"""
         try:
             await event.send(MessageChain(chain=list(comps)))
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("消息发送失败")
         try:
             event.stop_event()
@@ -369,7 +366,7 @@ class JX3MingpianPlugin(Star):
 
         try:
             url = await self._render(help_payload(), load_help_template())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("帮助图渲染失败")
             await self._send_text(event, f"渲染帮助图失败：{exc}")
             return
@@ -425,7 +422,7 @@ class JX3MingpianPlugin(Star):
         except (JX3APIError, ImageAPIError) as exc:
             await self._send_text(event, f"名片卡生成失败：{exc}")
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("名片卡生成异常")
             await self._send_text(event, f"名片卡生成失败：{exc}")
             return
@@ -434,7 +431,7 @@ class JX3MingpianPlugin(Star):
 
         try:
             url = await self._render(payload)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("名片卡渲染失败")
             await self._send_text(event, f"渲染图片失败：{exc}")
             return
@@ -524,7 +521,7 @@ class JX3MingpianPlugin(Star):
         except (JX3APIError, ImageAPIError) as exc:
             await self._send_text(event, f"名片特写生成失败：{exc}")
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("名片特写生成异常")
             await self._send_text(event, f"名片特写生成失败：{exc}")
             return

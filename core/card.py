@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import logging
 import random
 import tempfile
 from dataclasses import dataclass
@@ -28,8 +27,6 @@ from .mingpian_data import (
 )
 from .prompts import Prompt
 from .sizes import DEFAULT_CARD_RATIO, RATIO_SIZES, prompt_size
-
-logger = logging.getLogger("astrbot")
 
 ASSET_ROOT = Path(__file__).resolve().parent.parent / "templates"
 FONT_DIR = ASSET_ROOT / "font"
