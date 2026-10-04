@@ -515,7 +515,7 @@ class TestResolveCard:
 
             async def get_bytes(self, url):
                 calls.append("get_bytes")
-                return b"\x89PNG-art"
+                return b"\x89PNG\r\n\x1a\n-art"
 
             async def role_detail(self, server, name):
                 calls.append("role_detail")
@@ -538,6 +538,63 @@ class TestResolveCard:
         assert source.nickname == "小螺卜头"
 
 
+class TestArtFormat:
+    """角色形象图按真实字节定后缀。后缀写错时接口会把它当坏图丢掉，
+    出图就变成与角色无关的随机生成。"""
+
+    @pytest.mark.parametrize(
+        "art, expected",
+        [
+            (b"\x89PNG\r\n\x1a\n" + b"x" * 20, ".png"),
+            (b"\xff\xd8\xff" + b"x" * 20, ".jpg"),
+            (b"RIFF\x00\x00\x00\x00WEBP" + b"x" * 20, ".webp"),
+            (b"GIF89a" + b"x" * 20, ".gif"),
+            (b"<!DOCTYPE html><html><body>403</body></html>", ""),
+            (b'{"code":500,"msg":"error"}', ""),
+            (b"", ""),
+        ],
+    )
+    def test_按文件头判断后缀(self, art, expected):
+        from core.card import _art_suffix
+
+        assert _art_suffix(art) == expected
+
+    def test_后缀随真实格式(self, tmp_path):
+        from core.card import _art_path
+
+        path = _art_path(str(tmp_path), b"\xff\xd8\xff" + b"x" * 20)
+        assert path.name == "art.jpg"
+        assert path.read_bytes().startswith(b"\xff\xd8\xff")
+
+    def test_认不出图片就中止(self, tmp_path):
+        from core.card import _art_path
+
+        with pytest.raises(ImageAPIError):
+            _art_path(str(tmp_path), b"<!DOCTYPE html><html>403</html>")
+
+    async def test_参考图的_content_type_按后缀(self, monkeypatch, tmp_path):
+        seen: dict = {}
+        original = FormData.add_field
+
+        def spy(self, name, value, **kwargs):
+            if name == "image[]":
+                seen["content_type"] = kwargs.get("content_type")
+            return original(self, name, value, **kwargs)
+
+        monkeypatch.setattr(FormData, "add_field", spy)
+
+        async def fake_post(self, url, key, *, form):
+            return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+
+        monkeypatch.setattr(ImageAPIClient, "_post", fake_post)
+        ref = tmp_path / "art.jpg"
+        ref.write_bytes(b"\xff\xd8\xff" + b"x" * 20)
+        await ImageAPIClient("https://hub.example.com", "k").edit(
+            "提示词", [ref], size="2048x880"
+        )
+        assert seen["content_type"] == "image/jpeg"
+
+
 class TestReferenceImages:
     """名片特写只传角色图；名片卡额外传卡面样式参考图。"""
 
@@ -551,7 +608,7 @@ class TestReferenceImages:
             body="萝莉",
             camp="恶人谷",
             tong="英雄长乐坊",
-            art=b"\x89PNG-art",
+            art=b"\x89PNG\r\n\x1a\n-art",
             card_no=1,
             card_total=4,
             accent="#123456",
@@ -1223,7 +1280,7 @@ class TestBuildCard:
                 body="萝莉",
                 camp="恶人谷",
                 tong="英雄长乐坊",
-                art=b"\x89PNG-art",
+                art=b"\x89PNG\r\n\x1a\n-art",
                 card_no=1,
                 card_total=4,
                 accent="#123456",
@@ -1717,8 +1774,11 @@ class TestNoPersist:
     """生成内容不落盘：临时文件一律在 TemporaryDirectory 内，随用随清。"""
 
     def test_每次写文件都在临时目录里(self):
+        """唯一的写盘入口是 _art_path，它只接收 TemporaryDirectory 给出的目录。"""
         text = (ROOT / "core" / "card.py").read_text(encoding="utf-8")
-        assert text.count("tempfile.TemporaryDirectory") == text.count(".write_bytes(")
+        assert text.count(".write_bytes(") == 1, "写盘只允许出现在 _art_path 里"
+        assert "def _art_path(tmpdir" in text
+        assert text.count("= _art_path(") == text.count("tempfile.TemporaryDirectory")
 
     def test_只有绑定数据持久化(self):
         writers = [

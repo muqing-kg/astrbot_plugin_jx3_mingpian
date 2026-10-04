@@ -17,6 +17,7 @@ import asyncio
 import base64
 import binascii
 import json
+import mimetypes
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -240,9 +241,8 @@ class ImageAPIClient:
                         "image[]",
                         path.read_bytes(),
                         filename=path.name,
-                        content_type="image/png"
-                        if path.suffix.lower() == ".png"
-                        else "image/jpeg",
+                        # 按文件名推断，与文件真实格式一致（调用方按字节定后缀）
+                        content_type=mimetypes.guess_type(path.name)[0] or "image/png",
                     )
                 logger.info(
                     "生图请求 %s model=%s size=%s 参考图 %d 张（密钥 %d/%d，第 %d 次）",

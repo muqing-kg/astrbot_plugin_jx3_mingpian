@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from astrbot.api import logger
+
 from .image_api import ImageAPIClient, ImageAPIError
 from .jx3api import JX3APIClient, JX3APIError
 from .mingpian_data import (
@@ -42,6 +44,41 @@ def _data_uri(path: Path, mime: str) -> str:
     if not path.exists():
         return ""
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+# 名片形象图的文件头 → 后缀。接口按我们给出的后缀判定 content-type，
+# 一律写 .png 时，若服务实际返回 JPEG 或 WebP，这张参考图会被当成坏图
+_ART_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+
+def _art_suffix(art: bytes) -> str:
+    """按文件头判断图片格式，认不出返回空串。"""
+    for magic, suffix in _ART_MAGIC:
+        if art.startswith(magic):
+            return suffix
+    if art[:4] == b"RIFF" and art[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def _art_path(tmpdir: str, art: bytes) -> Path:
+    """把角色形象图落到临时文件，后缀按真实字节给出。
+
+    认不出图片格式时直接中止：否则会把 HTML 报错页之类的数据当成参考图发出去，
+    接口忽略它之后，出图就变成与角色无关的随机生成。
+    """
+    suffix = _art_suffix(art)
+    if not suffix:
+        raise ImageAPIError("名片形象图不是可识别的图片，已中止本次生成")
+    path = Path(tmpdir) / f"art{suffix}"
+    path.write_bytes(art)
+    logger.info("角色形象图 %s，%d 字节", suffix, len(art))
+    return path
 
 
 @lru_cache(maxsize=1)
@@ -189,8 +226,7 @@ async def generate_base(
     为假时只传角色形象图。
     """
     with tempfile.TemporaryDirectory(prefix="jx3_mingpian_") as tmpdir:
-        art_path = Path(tmpdir) / "art.png"
-        art_path.write_bytes(source.art)
+        art_path = _art_path(tmpdir, source.art)
         ref = ref_card_path() if with_card_ref else ""
         refs = [Path(ref), art_path] if ref else [art_path]
         return await image.edit(prompt, refs, size=size, quality="high")
@@ -199,8 +235,7 @@ async def generate_base(
 async def generate_avatar(image: ImageAPIClient, source: CardSource) -> bytes:
     """生成正面头像。"""
     with tempfile.TemporaryDirectory(prefix="jx3_mingpian_") as tmpdir:
-        art_path = Path(tmpdir) / "art.png"
-        art_path.write_bytes(source.art)
+        art_path = _art_path(tmpdir, source.art)
         return await image.edit(
             AVATAR_PROMPT, [art_path], size=AVATAR_SIZE, quality="high"
         )
