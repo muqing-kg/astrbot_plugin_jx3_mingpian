@@ -54,7 +54,7 @@ from .core.servers import canonical_server, server_list_text
 from .core.sizes import card_size
 
 PLUGIN_NAME = "astrbot_plugin_jx3_mingpian"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 COMMAND = "名片卡"
 CLOSEUP_COMMAND = "名片特写"
 BIND_COMMAND = "名片绑定"

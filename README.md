@@ -286,6 +286,8 @@
 ```
 main.py                       插件入口与命令
 _conf_schema.json             配置项定义
+metadata.yaml                 插件元信息
+CHANGELOG.md                  更新日志
 logo.png                      插件图标
 core/
   image_api.py                生图接口客户端

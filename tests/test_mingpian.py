@@ -233,6 +233,19 @@ class TestApiContract:
     def test_示例图片存在(self):
         assert (ROOT / "docs" / "sample.jpg").is_file()
 
+    def test_版本号与更新日志一致(self):
+        """metadata 的版本号、main.py 的常量、更新日志最新一条，三者必须相同。"""
+        meta = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
+        version = re.search(r"^version:\s*(\S+)", meta, re.MULTILINE).group(1)
+
+        log = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        newest = re.search(r"\*\*v([0-9.]+)-", log)
+        assert newest, "更新日志里找不到版本条目"
+        assert newest.group(1) == version, "更新日志最新一条与 metadata 版本号不一致"
+
+        main = (ROOT / "main.py").read_text(encoding="utf-8")
+        assert f'PLUGIN_VERSION = "{version}"' in main
+
 
 class TestProxySeparation:
     def test_jx3_带代理(self):
