@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 
 def _install_fake_astrbot() -> None:
@@ -18,7 +18,8 @@ def _install_fake_astrbot() -> None:
     core_utils = types.ModuleType("astrbot.core.utils")
     session_waiter = types.ModuleType("astrbot.core.utils.session_waiter")
 
-    api.logger = logging.getLogger("test-mingpian")
+    # 插件统一从 astrbot.api 取 logger；测试里吞掉日志调用即可
+    api.logger = MagicMock()
     api.AstrBotConfig = dict
     api.message_components = components
     core.html_renderer = types.SimpleNamespace()
