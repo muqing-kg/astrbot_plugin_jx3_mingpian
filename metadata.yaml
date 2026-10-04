@@ -1,7 +1,7 @@
 name: astrbot_plugin_jx3_mingpian
 display_name: 剑网3 名片卡（生图）
 desc: 抽角色名片形象图，交给生图模型出底卡，再叠文字与门派元素，生成剑网3风格名片卡。
-version: 1.1.1
+version: 1.2.0
 author: 沐倾
 repo: https://github.com/muqing-kg/astrbot_plugin_jx3_mingpian
 astrbot_version: ">=4.11.0"
