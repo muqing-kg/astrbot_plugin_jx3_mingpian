@@ -30,7 +30,7 @@ if "astrbot" not in sys.modules:
 
 from core.card import build_payload
 
-CARD_W, CARD_H = 1280, 700
+CARD_W, CARD_H = 1280, 720
 SCALE = 2
 TEMPLATE = ROOT / "templates" / "standalone" / "mingpian.html"
 

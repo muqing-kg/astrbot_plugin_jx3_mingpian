@@ -36,7 +36,9 @@
             -webkit-font-smoothing: antialiased;
         }
 
-        /* 官方名片实际比例约 1.83:1（1255x685），这里取 1280x700 */
+        /* 画布取 1280x720（16:9）：与默认的生图底图比例一致，也与渲染视口同高。
+           比例不一致时 cover 会上下裁掉各 10 像素，把底图自带的齿孔边框裁没一边，
+           截图还会因视口更高而多出一条空白底边 */
         .card {
             /* 门派配色：由 core/mingpian_data.py 从门派徽记取主色 */
             --accent: {{ accent | default('#c9a0dc') }};
@@ -44,7 +46,7 @@
 
             position: relative;
             width: 1280px;
-            height: 700px;
+            height: 720px;
             overflow: hidden;
             border-radius: 10px;
             background: linear-gradient(135deg,
@@ -96,7 +98,7 @@
         }
 
 
-        /* 以下坐标按官方卡量取：卡 1255x685，本模板 1280x700（×1.0199）
+        /* 以下坐标按官方卡量取：卡 1255x685，本模板宽度按 ×1.0199 折算为 1280
            头像圆心 (161,181) 直径 131 → 本模板 (97,118) 直径 134 */
         .info__avatar {
             position: absolute;
